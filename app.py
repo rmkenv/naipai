@@ -552,7 +552,59 @@ with info_col:
 
 st.markdown("---")
 
-# ── Section 2: Imagery + Results + Chat (side by side) ───────────────────────
+# ── Section 2: Imagery + Results + Chat ──────────────────────────────────────
+
+# When search results exist, show them full-width above the chat
+if st.session_state.result_chip_bytes:
+    chip_bytes = st.session_state.result_chip_bytes
+    scores     = st.session_state.result_scores
+    n_show     = min(len(chip_bytes), 8)
+
+    st.markdown("#### 🔍 Similar Locations Found")
+    st.caption(f"Showing {n_show} most similar tiles · cosine similarity scores shown below each")
+
+    # Query tile + all results in one scrollable row of equal-size images
+    # Show query tile first, then results
+    total_cols = n_show + 1  # +1 for the query tile
+    all_cols   = st.columns(total_cols)
+
+    # Query tile (the tile the search was seeded from)
+    all_cols[0].image(st.session_state.naip_img_bytes, use_container_width=True)
+    all_cols[0].markdown(
+        '<p class="result-chip" style="color:#00e5ff;font-weight:700;">QUERY</p>',
+        unsafe_allow_html=True)
+
+    # Result tiles
+    for k in range(n_show):
+        all_cols[k+1].image(chip_bytes[k], use_container_width=True)
+        all_cols[k+1].markdown(
+            f'<p class="result-chip">{scores[k]:.3f}</p>',
+            unsafe_allow_html=True)
+
+    # Result map full width
+    if st.session_state.result_map_html:
+        st.markdown("#### 📌 Match Locations")
+        components.html(st.session_state.result_map_html, height=320)
+
+    # Spectral cards if applicable
+    sr = st.session_state.result_spectral_reports
+    if sr:
+        st.markdown("#### 🌿 Spectral Index Summary")
+        spec_cols = st.columns(min(4, len(sr)))
+        for k, r in enumerate(sr[:4]):
+            with spec_cols[k]:
+                bars = (spectral_bar("NDVI", r["ndvi"]) +
+                        spectral_bar("NDWI", r["ndwi"]) +
+                        spectral_bar("EVI",  r["evi"])  +
+                        spectral_bar("Brightness", r["brightness"]*2-1))
+                st.markdown(
+                    f'<div class="spectral-card">' +
+                    f'<div style="font-size:0.72rem;color:#8b949e;font-family:Space Mono,monospace;margin-bottom:6px;">' +
+                    f'Match #{k+1} · {r["ndvi_class"]}</div>' +
+                    f'{bars}</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
 img_col, chat_col = st.columns([1, 1], gap="large")
 
 with img_col:
@@ -561,53 +613,6 @@ with img_col:
         st.image(st.session_state.naip_img_bytes, use_container_width=True)
     else:
         st.info("Load a tile above to see imagery here.")
-
-    # ── Search results (always rendered if available) ─────────────────────────
-    if st.session_state.result_chip_bytes:
-        st.markdown("#### Similar Locations")
-
-        chip_bytes = st.session_state.result_chip_bytes
-        scores     = st.session_state.result_scores
-        n_show     = min(len(chip_bytes), 8)
-        n_cols     = min(n_show, 4)
-
-        # Row 1
-        cols1 = st.columns(n_cols)
-        for k in range(min(n_cols, n_show)):
-            cols1[k].image(chip_bytes[k], use_container_width=True)
-            cols1[k].markdown(
-                f'<p class="result-chip">{scores[k]:.3f}</p>',
-                unsafe_allow_html=True)
-
-        # Row 2 (if more than 4)
-        if n_show > 4:
-            cols2 = st.columns(n_cols)
-            for k in range(4, n_show):
-                cols2[k-4].image(chip_bytes[k], use_container_width=True)
-                cols2[k-4].markdown(
-                    f'<p class="result-chip">{scores[k]:.3f}</p>',
-                    unsafe_allow_html=True)
-
-        # Result map
-        if st.session_state.result_map_html:
-            st.markdown("#### Match Locations on Map")
-            components.html(st.session_state.result_map_html, height=280)
-
-        # Spectral cards
-        sr = st.session_state.result_spectral_reports
-        if sr:
-            st.markdown("#### Spectral Index Summary")
-            for k,r in enumerate(sr[:4]):
-                bars = (spectral_bar("NDVI", r["ndvi"]) +
-                        spectral_bar("NDWI", r["ndwi"]) +
-                        spectral_bar("EVI",  r["evi"])  +
-                        spectral_bar("Brightness", r["brightness"]*2-1))
-                st.markdown(
-                    f'<div class="spectral-card">'
-                    f'<div style="font-size:0.72rem;color:#8b949e;'
-                    f'font-family:Space Mono,monospace;margin-bottom:6px;">'
-                    f'Match #{k+1} · {r["ndvi_class"]} · {r["ndwi_class"]}</div>'
-                    f'{bars}</div>', unsafe_allow_html=True)
 
 with chat_col:
     st.markdown("#### Ask anything about this image")
