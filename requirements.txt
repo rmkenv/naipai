@@ -1,0 +1,39 @@
+# NAIP Intelligence Platform — combined requirements
+# Merges naipchat + openembed dependencies
+
+# Core
+streamlit>=1.35.0
+python-dotenv>=1.0.0
+openai>=1.30.0
+
+# Planetary Computer / STAC
+pystac-client>=0.7.6
+planetary-computer>=1.0.0
+
+# Raster I/O
+rasterio>=1.3.0
+rioxarray>=0.15.0
+
+# Geospatial
+geopandas>=0.14.0
+shapely>=2.0.0
+
+# Image / array
+Pillow>=10.0.0
+numpy>=1.26.0
+pandas>=2.0.0
+
+# PyTorch — CPU build (swap torch+cu121 for GPU hosts)
+torch>=2.2.0
+torchvision>=0.17.0
+
+# Similarity search
+faiss-cpu>=1.8.0
+
+# Visualization
+folium>=0.16.0
+streamlit-folium>=0.20.0
+plotly>=5.20.0
+
+# Embedding space (optional but included)
+umap-learn>=0.5.6
