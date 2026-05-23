@@ -169,3 +169,53 @@ def save_meta(meta: dict, path: Path):
 def load_meta(path: Path) -> dict:
     with open(path, "rb") as f:
         return pickle.load(f)
+
+
+def chip_scene_4band(
+    ds,
+    chip_size: int = DEFAULT_CHIP_SIZE,
+    stride: int | None = None,
+    max_chips: int = MAX_CHIPS,
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """
+    Like chip_scene but retains all 4 NAIP bands (R, G, B, NIR).
+    Used for spectral index computation.
+
+    Returns
+    -------
+    chips4    : np.ndarray  shape (N, 4, chip_size, chip_size) float32 [0,1]
+    positions : list of (row, col) — same grid as chip_scene with same params
+    """
+    if stride is None:
+        stride = chip_size // 2
+
+    n_bands = ds.values.shape[0]
+    bands   = min(n_bands, 4)
+    arr     = ds.values[:bands].astype(np.float32)
+
+    # Per-band percentile stretch to [0, 1]
+    arr_norm = np.zeros_like(arr)
+    for b in range(bands):
+        lo = np.percentile(arr[b], 2)
+        hi = np.percentile(arr[b], 98)
+        arr_norm[b] = np.clip((arr[b] - lo) / (hi - lo + 1e-8), 0, 1)
+
+    if bands < 4:
+        pad = np.zeros((4 - bands, arr.shape[1], arr.shape[2]), dtype=np.float32)
+        arr_norm = np.concatenate([arr_norm, pad], axis=0)
+
+    _, H, W = arr_norm.shape
+    chips, positions = [], []
+
+    for y in range(0, H - chip_size, stride):
+        for x in range(0, W - chip_size, stride):
+            chip = arr_norm[:, y : y + chip_size, x : x + chip_size]
+            if chip.shape == (4, chip_size, chip_size):
+                chips.append(chip)
+                positions.append((y, x))
+            if len(chips) >= max_chips:
+                break
+        if len(chips) >= max_chips:
+            break
+
+    return np.stack(chips), positions

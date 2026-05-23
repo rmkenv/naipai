@@ -30,16 +30,20 @@ OLLAMA_HOST_DEFAULT  = os.getenv("OLLAMA_HOST", "")
 OLLAMA_KEY_DEFAULT   = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL_DEFAULT = os.getenv("OLLAMA_MODEL", "qwen3-vl:7b")
 
+# ── Intent routing ────────────────────────────────────────────────────────────
 INTENT_SYSTEM_PROMPT = """\
-You are a routing classifier for a geospatial imagery analysis app.
-The user is looking at an aerial NAIP image and has typed a message.
+You are a routing classifier for a geospatial aerial imagery analysis app.
 
-Classify their intent as exactly one of:
-  CHAT      — they want analysis, description, questions answered, or general conversation about the image
-  SEARCH    — they want to FIND or LOCATE specific features/objects within the image
-              (keywords: find, locate, show me, where is, highlight, search for, detect, identify all)
+Classify the user's message into exactly ONE of:
+  CHAT      — analysis, description, questions, or conversation about the image
+  SEARCH    — find/locate specific visual features in the image
+              (keywords: find, locate, show me, where is, highlight, detect, identify all)
+  SPECTRAL  — query based on spectral indices, vegetation health, land cover type,
+              or any mention of: NDVI, NDWI, EVI, SAVI, vegetation, greenness,
+              impervious surface, brightness, water, bare soil, urban heat,
+              stressed vegetation, high/low index, spectral signature
 
-Reply with ONLY the single word: CHAT or SEARCH
+Reply with ONLY one word: CHAT, SEARCH, or SPECTRAL
 """
 
 ANALYSIS_SYSTEM_PROMPT = """\
@@ -59,6 +63,14 @@ SEARCH_DESCRIPTION_PROMPT = """\
 You are helping interpret visual similarity search results from aerial imagery.
 The user asked to find specific features. Briefly describe what was found across
 the top matching image chips in 2-3 sentences. Be concrete and geographic.
+"""
+
+SPECTRAL_DESCRIPTION_PROMPT = """\
+You are a remote sensing analyst explaining spectral index search results.
+Given the user's query and the spectral metrics of the top matching chips,
+write 2-3 sentences describing what was found — what land cover or condition
+these chips represent and why the spectral indices support that interpretation.
+Be specific about the index values where relevant (e.g. NDVI > 0.6 = dense canopy).
 """
 
 # ── Embedding model ───────────────────────────────────────────────────────────

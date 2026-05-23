@@ -1,40 +1,47 @@
 """
 NAIP Intelligence Platform
 ===========================
-One unified interface: ask anything about the imagery.
-  — Describe / analyze / question  →  VLM answers conversationally
-  — Find / locate / search for     →  ResNet-50 + FAISS similarity search
-                                       highlights matching locations on the map
+One chat interface, three modes — routed automatically by intent:
+
+  CHAT      Ask anything about the imagery (VLM analysis)
+  SEARCH    Find features visually (ResNet-50 + FAISS cosine)
+  SPECTRAL  Query by spectral index / land cover signature
+            (NDVI, NDWI, EVI, SAVI, NDBI, brightness -- 4-band NAIP)
 
 Data: USDA NAIP via Microsoft Planetary Computer
 """
 
-import io, sys, logging, traceback, base64
+import io, sys, logging, base64
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
-import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 import pystac_client
 import planetary_computer as pc
 import rasterio
 from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds
-from PIL import Image
-import folium
-from streamlit_folium import st_folium
+from PIL import Image, ImageDraw
 
 import config
 from utils.imagery import (
-    search_naip_scenes, load_naip_scene, chip_scene,
+    load_naip_scene, chip_scene, chip_scene_4band,
     build_chip_geodataframe, cache_path,
     save_chips, load_chips, save_meta, load_meta,
 )
 from utils.embeddings import (
-    load_model, embed_chips, build_index, query_index,
+    load_model, embed_chips, build_index, query_index, query_index_vec,
     save_index, load_index, save_embeddings, load_embeddings,
+)
+from utils.spectral import (
+    compute_spectral_embeddings, build_spectral_index,
+    query_spectral_index, query_spectral_by_chip,
+    concept_to_spectral_vector, get_chip_spectral_report,
+    save_spectral_index, load_spectral_index,
+    save_spectral_embeddings, load_spectral_embeddings,
 )
 from utils.viz import build_result_map
 
@@ -42,522 +49,465 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("naip_platform")
 
-# ── Page ──────────────────────────────────────────────────────────────────────
+# -- Page ---------------------------------------------------------------------
 st.set_page_config(
-    page_title=config.APP_TITLE,
-    page_icon=config.APP_ICON,
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title=config.APP_TITLE, page_icon=config.APP_ICON,
+    layout="wide", initial_sidebar_state="expanded",
 )
-
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
-  html, body, [class*="css"]   { font-family: 'DM Sans', sans-serif; }
-  h1, h2, h3                   { font-family: 'Space Mono', monospace; }
-  .stApp                       { background: #0d1117; color: #c9d1d9; }
-  div[data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #21262d; }
-
-  .badge {
-    display: inline-block;
-    background: #1f6feb22; color: #58a6ff;
-    border: 1px solid #1f6feb55; border-radius: 4px;
-    padding: 2px 10px; font-size: 0.72rem;
-    font-family: 'Space Mono', monospace;
-    letter-spacing: 0.08em; margin-right: 4px;
-  }
-  .intent-pill {
-    display: inline-block; border-radius: 12px;
-    padding: 2px 12px; font-size: 0.72rem;
-    font-family: 'Space Mono', monospace; font-weight: 700;
-    letter-spacing: 0.1em; margin-bottom: 6px;
-  }
-  .pill-chat   { background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66; }
-  .pill-search { background: #23863633; color: #3fb950; border: 1px solid #23863666; }
-  .result-chip { text-align: center; font-size: 0.7rem;
-                 color: #8b949e; font-family: 'Space Mono', monospace; }
-  .stButton > button {
-    background: #21262d; color: #c9d1d9;
-    border: 1px solid #30363d; border-radius: 6px;
-    font-family: 'Space Mono', monospace; font-size: 0.8rem;
-  }
-  .stButton > button:hover { background: #238636; color: #fff; border-color: #238636; }
-  .hint-box {
-    background: #161b22; border: 1px solid #21262d;
-    border-radius: 8px; padding: 10px 16px;
-    font-size: 0.8rem; color: #8b949e; margin-bottom: 12px;
-  }
+  html,body,[class*="css"] { font-family:'DM Sans',sans-serif; }
+  h1,h2,h3                 { font-family:'Space Mono',monospace; }
+  .stApp                   { background:#0d1117; color:#c9d1d9; }
+  div[data-testid="stSidebar"] { background:#161b22; border-right:1px solid #21262d; }
+  .badge { display:inline-block; background:#1f6feb22; color:#58a6ff;
+    border:1px solid #1f6feb55; border-radius:4px; padding:2px 10px;
+    font-size:0.72rem; font-family:'Space Mono',monospace;
+    letter-spacing:0.08em; margin-right:4px; }
+  .intent-pill { display:inline-block; border-radius:12px; padding:2px 12px;
+    font-size:0.72rem; font-family:'Space Mono',monospace; font-weight:700;
+    letter-spacing:0.1em; margin-bottom:6px; }
+  .pill-chat     { background:#1f6feb33; color:#58a6ff; border:1px solid #1f6feb66; }
+  .pill-search   { background:#23863633; color:#3fb950; border:1px solid #23863666; }
+  .pill-spectral { background:#6e40c933; color:#bc8cff; border:1px solid #6e40c966; }
+  .result-chip   { text-align:center; font-size:0.7rem; color:#8b949e;
+                   font-family:'Space Mono',monospace; }
+  .spectral-card { background:#161b22; border:1px solid #21262d; border-radius:8px;
+                   padding:10px 14px; margin-bottom:6px; }
+  .idx-row  { display:flex; justify-content:space-between; font-size:0.78rem; margin:3px 0; }
+  .idx-name { color:#8b949e; font-family:'Space Mono',monospace; }
+  .idx-val  { color:#e6edf3; font-weight:600; }
+  .idx-bar-wrap { height:6px; background:#21262d; border-radius:3px; margin:2px 0 6px 0; }
+  .idx-bar  { height:6px; border-radius:3px; }
+  .stButton > button { background:#21262d; color:#c9d1d9; border:1px solid #30363d;
+    border-radius:6px; font-family:'Space Mono',monospace; font-size:0.8rem; }
+  .stButton > button:hover { background:#238636; color:#fff; border-color:#238636; }
+  .hint-box { background:#161b22; border:1px solid #21262d; border-radius:8px;
+    padding:10px 16px; font-size:0.78rem; color:#8b949e;
+    margin-bottom:12px; line-height:1.6; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("# 🛰️ NAIP Intelligence Platform")
 st.markdown(
     '<span class="badge">PLANETARY COMPUTER</span>'
     '<span class="badge">QWEN3-VL</span>'
     '<span class="badge">RESNET-50 · FAISS</span>'
-    '<span class="badge">NYC DEFAULT</span>',
+    '<span class="badge">NDVI · NDWI · EVI · SAVI · NDBI</span>',
     unsafe_allow_html=True,
 )
 
-# ── Session state init ────────────────────────────────────────────────────────
-DEFAULTS = {
+# -- Session state ------------------------------------------------------------
+for k, v in {
     "naip_img": None, "naip_b64": None, "naip_scene": None,
     "messages": [],
-    "chips": None, "positions": None, "embeddings": None,
-    "faiss_idx": None, "chip_gdf": None, "scene_id": None,
-    "last_bbox": None,
-    "result_map_html": None, "result_chips": None, "result_scores": None,
-}
-for k, v in DEFAULTS.items():
+    "chips": None, "embeddings": None, "faiss_idx": None,
+    "chip_gdf": None, "scene_id": None,
+    "chips4": None, "spectral_embs": None, "spectral_idx": None,
+    "result_map_html": None, "result_chips": None,
+    "result_scores": None, "result_indices": None,
+    "result_spectral_reports": None,
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
+# -- Sidebar ------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
-
-    def _secret(key, default=""):
-        try:    return st.secrets[key]
-        except: return default
-
-    ollama_host  = st.text_input("Ollama Host",  value=_secret("OLLAMA_HOST",  config.OLLAMA_HOST_DEFAULT))
-    ollama_key   = st.text_input("API Key",       value=_secret("OLLAMA_API_KEY", config.OLLAMA_KEY_DEFAULT), type="password")
-    ollama_model = st.text_input("Model",         value=_secret("OLLAMA_MODEL",  config.OLLAMA_MODEL_DEFAULT))
-
+    st.markdown("### Configuration")
+    def _s(k, d=""):
+        try:    return st.secrets[k]
+        except: return d
+    ollama_host  = st.text_input("Ollama Host",  value=_s("OLLAMA_HOST",  config.OLLAMA_HOST_DEFAULT))
+    ollama_key   = st.text_input("API Key",       value=_s("OLLAMA_API_KEY", config.OLLAMA_KEY_DEFAULT), type="password")
+    ollama_model = st.text_input("Model",         value=_s("OLLAMA_MODEL",  config.OLLAMA_MODEL_DEFAULT))
     st.markdown("---")
     st.markdown("**Scene settings**")
-    year      = st.selectbox("NAIP Year", config.NAIP_YEARS, index=2)
+    year      = st.selectbox("NAIP Year",       config.NAIP_YEARS, index=2)
     chip_size = st.select_slider("Chip size (px)", [112, 224, 336], value=224)
-    top_k     = st.slider("Results to find", 3, 20, config.DEFAULT_TOP_K)
-
+    top_k     = st.slider("Results to return", 3, 20, config.DEFAULT_TOP_K)
     st.markdown("---")
     st.markdown("**How to use**")
-    st.markdown("""
-<div class="hint-box">
-Ask anything in the chat below.<br><br>
-<b>To analyze:</b> "What land cover types are present?" or "Describe the road network."<br><br>
-<b>To find:</b> "Find all parking lots" or "Locate green spaces" or "Show me rooftops."
-</div>
-""", unsafe_allow_html=True)
-
+    st.markdown("""<div class="hint-box">
+<b>Chat:</b> "What land cover is present?"<br>
+<b>Visual search:</b> "Find all parking lots" · "Locate rooftops"<br>
+<b>Spectral search:</b> "Where is NDVI highest?" · "Find stressed vegetation" ·
+"Show impervious surfaces" · "Areas with high NDWI"
+</div>""", unsafe_allow_html=True)
     st.caption("Data: USDA NAIP via Planetary Computer")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# OLLAMA CLIENT
-# ══════════════════════════════════════════════════════════════════════════════
+# -- Helpers ------------------------------------------------------------------
 def get_client():
-    if not ollama_host or not ollama_key:
-        return None
-    return OpenAI(
-        base_url=f"{ollama_host.rstrip('/')}/v1",
-        api_key=ollama_key,
-    )
+    if not ollama_host or not ollama_key: return None
+    return OpenAI(base_url=f"{ollama_host.rstrip('/')}/v1", api_key=ollama_key)
 
-def classify_intent(user_text: str) -> str:
-    """Returns 'CHAT' or 'SEARCH'."""
+def classify_intent(text):
     client = get_client()
-    if not client:
-        return "CHAT"
+    if not client: return "CHAT"
     try:
-        resp = client.chat.completions.create(
+        r = client.chat.completions.create(
             model=ollama_model,
-            messages=[
-                {"role": "system", "content": config.INTENT_SYSTEM_PROMPT},
-                {"role": "user",   "content": user_text},
-            ],
-            max_tokens=5,
-            temperature=0,
-        )
-        word = resp.choices[0].message.content.strip().upper()
-        return "SEARCH" if "SEARCH" in word else "CHAT"
-    except Exception:
+            messages=[{"role":"system","content":config.INTENT_SYSTEM_PROMPT},
+                      {"role":"user","content":text}],
+            max_tokens=5, temperature=0)
+        w = r.choices[0].message.content.strip().upper()
+        if "SPECTRAL" in w: return "SPECTRAL"
+        if "SEARCH"   in w: return "SEARCH"
         return "CHAT"
+    except: return "CHAT"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# NAIP FETCH (point + buffer → RGB chip)
-# ══════════════════════════════════════════════════════════════════════════════
+def spectral_bar(name, value):
+    pct = max(0, min(100, int((value + 1) / 2 * 100)))
+    color = ("#3fb950" if value > 0.3 else
+             "#58a6ff" if value > 0.0 else
+             "#d29922" if value > -0.2 else "#f85149")
+    return (f'<div class="idx-row"><span class="idx-name">{name}</span>'
+            f'<span class="idx-val">{value:+.3f}</span></div>'
+            f'<div class="idx-bar-wrap"><div class="idx-bar" '
+            f'style="width:{pct}%;background:{color};"></div></div>')
+
+# -- NAIP fetch ---------------------------------------------------------------
 def fetch_naip_point(lat, lon, buf=0.003):
     catalog = pystac_client.Client.open(config.PC_STAC_URL, modifier=pc.sign_inplace)
-    bbox = [lon - buf, lat - buf, lon + buf, lat + buf]
-    results = catalog.search(
+    bbox = [lon-buf, lat-buf, lon+buf, lat+buf]
+    items = list(catalog.search(
         collections=[config.NAIP_COLLECTION], bbox=bbox,
-        limit=1, sortby="-properties.datetime",
-    )
-    items = list(results.items())
-    if not items:
-        raise ValueError("No NAIP scenes found at this location.")
-
+        limit=1, sortby="-properties.datetime").items())
+    if not items: raise ValueError("No NAIP scenes found here.")
     item = items[0]
-    href = item.assets["image"].href
-    with rasterio.open(href) as src:
+    with rasterio.open(item.assets["image"].href) as src:
         bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
-        window = from_bounds(*bounds, transform=src.transform)
-        data   = src.read([1, 2, 3], window=window)
-
-    data = np.moveaxis(data, 0, -1)
-    data = np.clip(data, 0, 255).astype(np.uint8)
+        data   = src.read([1,2,3], window=from_bounds(*bounds, transform=src.transform))
+    data = np.clip(np.moveaxis(data,0,-1), 0, 255).astype(np.uint8)
     img  = Image.fromarray(data)
+    bio  = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+    return img, base64.b64encode(bio.read()).decode(), item
 
-    buf_io = io.BytesIO()
-    img.save(buf_io, format="PNG")
-    buf_io.seek(0)
-    b64 = base64.b64encode(buf_io.read()).decode("utf-8")
-    return img, b64, item
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EMBEDDING INDEX (build or load from cache)
-# ══════════════════════════════════════════════════════════════════════════════
+# -- Index builder (visual + spectral) ----------------------------------------
 @st.cache_resource(show_spinner=False)
-def _load_resnet():
-    return load_model()
+def _load_resnet(): return load_model()
 
-def ensure_index(item, stride):
+def ensure_indexes(item):
     scene_id = item.id
-    if st.session_state.scene_id == scene_id and st.session_state.faiss_idx is not None:
-        return  # already built for this scene
+    stride   = int(chip_size * 0.5)
+    if (st.session_state.scene_id == scene_id
+            and st.session_state.faiss_idx is not None
+            and st.session_state.spectral_idx is not None):
+        return
 
-    chips_path = cache_path(scene_id, chip_size, stride, "_chips.npy")
-    embs_path  = cache_path(scene_id, chip_size, stride, "_embeddings.npy")
-    idx_path   = cache_path(scene_id, chip_size, stride, "_faiss.index")
-    meta_path  = cache_path(scene_id, chip_size, stride, "_meta.pkl")
-    cached     = all(p.exists() for p in [chips_path, embs_path, idx_path, meta_path])
+    cp   = cache_path(scene_id, chip_size, stride, "_chips.npy")
+    ep   = cache_path(scene_id, chip_size, stride, "_embeddings.npy")
+    ip   = cache_path(scene_id, chip_size, stride, "_faiss.index")
+    mp   = cache_path(scene_id, chip_size, stride, "_meta.pkl")
+    cp4  = cache_path(scene_id, chip_size, stride, "_chips4.npy")
+    sep  = cache_path(scene_id, chip_size, stride, "_spectral_embs.npy")
+    sip  = cache_path(scene_id, chip_size, stride, "_spectral.index")
 
-    if cached:
-        chips     = load_chips(chips_path)
-        embs      = load_embeddings(embs_path)
-        faiss_idx = load_index(idx_path)
-        meta      = load_meta(meta_path)
+    vc = all(p.exists() for p in [cp, ep, ip, mp])
+    sc = all(p.exists() for p in [cp4, sep, sip])
+
+    if vc and sc:
+        st.info("Loading indexes from cache...")
+        chips = load_chips(cp); embs = load_embeddings(ep)
+        fidx  = load_index(ip); meta = load_meta(mp)
+        chips4= load_chips(cp4); sembs= load_spectral_embeddings(sep)
+        sidx  = load_spectral_index(sip)
     else:
-        with st.spinner("📥 Loading full NAIP scene for indexing…"):
-            ds, _ = load_naip_scene(item)
+        with st.spinner("Loading NAIP scene..."):
+            ds, ov = load_naip_scene(item)
+        st.success(f"Scene loaded - {ds.shape[1]}x{ds.shape[2]} px (overview {ov})")
 
-        with st.spinner(f"✂️ Chipping scene into {chip_size}px tiles…"):
-            chips, positions = chip_scene(ds, chip_size=chip_size, stride=stride)
+        if not vc:
+            with st.spinner("Chipping scene (RGB)..."):
+                chips, positions = chip_scene(ds, chip_size=chip_size, stride=stride)
+                chip_gdf = build_chip_geodataframe(positions, ds, chip_size)
+            model, device = _load_resnet()
+            prog = st.progress(0.0, text="Visual embeddings...")
+            def vcb(done, total): prog.progress(done/total, text=f"Visual {done}/{total}")
+            embs = embed_chips(chips, model, device, progress_callback=vcb)
+            prog.empty()
+            fidx = build_index(embs)
+            np.save(str(cp), chips); save_embeddings(embs, ep)
+            save_index(fidx, ip); save_meta({"positions":positions,"chip_gdf":chip_gdf}, mp)
+        else:
+            chips=load_chips(cp); embs=load_embeddings(ep)
+            fidx=load_index(ip)
 
-        with st.spinner("📐 Building chip GeoDataFrame…"):
-            chip_gdf = build_chip_geodataframe(positions, ds, chip_size)
+        meta = load_meta(mp)
 
-        model, device = _load_resnet()
-        prog = st.progress(0.0, text="🧠 Embedding chips…")
+        if not sc:
+            with st.spinner("Chipping scene (RGBI 4-band)..."):
+                chips4, _ = chip_scene_4band(ds, chip_size=chip_size, stride=stride)
+            prog2 = st.progress(0.0, text="Spectral embeddings...")
+            def scb(done, total): prog2.progress(done/total, text=f"Spectral {done}/{total}")
+            sembs = compute_spectral_embeddings(chips4, progress_callback=scb)
+            prog2.empty()
+            sidx  = build_spectral_index(sembs)
+            np.save(str(cp4), chips4)
+            save_spectral_embeddings(sembs, sep); save_spectral_index(sidx, sip)
+        else:
+            chips4=load_chips(cp4); sembs=load_spectral_embeddings(sep)
+            sidx=load_spectral_index(sip)
 
-        def _cb(done, total):
-            prog.progress(done / total, text=f"🧠 Embedding {done}/{total}…")
+    st.session_state.chips=chips; st.session_state.embeddings=embs
+    st.session_state.faiss_idx=fidx; st.session_state.chip_gdf=meta["chip_gdf"]
+    st.session_state.chips4=chips4; st.session_state.spectral_embs=sembs
+    st.session_state.spectral_idx=sidx; st.session_state.scene_id=scene_id
+    st.success(f"Indexes ready - {len(chips)} chips · visual 2048-d · spectral {sembs.shape[1]}-d")
 
-        embs = embed_chips(chips, model, device, progress_callback=_cb)
-        prog.empty()
-
-        faiss_idx = build_index(embs)
-
-        save_chips(chips, chips_path)
-        save_embeddings(embs, embs_path)
-        save_index(faiss_idx, idx_path)
-        save_meta({"positions": positions, "chip_gdf": chip_gdf}, meta_path)
-
-        meta = {"positions": positions, "chip_gdf": chip_gdf}
-
-    st.session_state.chips      = chips
-    st.session_state.positions  = meta["positions"]
-    st.session_state.embeddings = embs
-    st.session_state.faiss_idx  = faiss_idx
-    st.session_state.chip_gdf   = meta["chip_gdf"]
-    st.session_state.scene_id   = scene_id
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SEARCH FLOW — find visually similar chips using a description
-# ══════════════════════════════════════════════════════════════════════════════
-def run_search(user_query: str, item) -> str:
-    stride = int(chip_size * 0.5)
-    ensure_index(item, stride)
-
-    chips     = st.session_state.chips
-    embs      = st.session_state.embeddings
-    faiss_idx = st.session_state.faiss_idx
-    chip_gdf  = st.session_state.chip_gdf
-    n_chips   = len(chips)
-
-    # Ask the VLM: "which chip index best represents '<query>'?"
-    # Build a 4x4 sample mosaic of chips with their indices labelled,
-    # then ask the model to pick the best starting chip.
-    sample_n   = min(16, n_chips)
-    step       = max(1, n_chips // sample_n)
-    sample_ids = list(range(0, n_chips, step))[:sample_n]
-
-    # Build a labelled mosaic image
-    cols_per_row = 4
-    rows_count   = (len(sample_ids) + cols_per_row - 1) // cols_per_row
-    mosaic_w     = chip_size * cols_per_row
-    mosaic_h     = chip_size * rows_count + 24 * rows_count  # room for labels
-    mosaic       = Image.new("RGB", (mosaic_w, mosaic_h + 24), (20, 20, 30))
-    from PIL import ImageDraw
-    draw = ImageDraw.Draw(mosaic)
-
-    for j, sid in enumerate(sample_ids):
-        row_j = j // cols_per_row
-        col_j = j % cols_per_row
-        rgb   = (chips[sid].transpose(1, 2, 0) * 255).astype(np.uint8)
-        chip_img = Image.fromarray(rgb)
-        x = col_j * chip_size
-        y = row_j * (chip_size + 24)
-        mosaic.paste(chip_img, (x, y))
-        draw.text((x + 4, y + chip_size + 4), f"#{sid}", fill=(150, 200, 255))
-
-    mosaic_io = io.BytesIO()
-    mosaic.save(mosaic_io, format="PNG")
-    mosaic_io.seek(0)
-    mosaic_b64 = base64.b64encode(mosaic_io.read()).decode("utf-8")
-
-    client = get_client()
-    pick_prompt = (
-        f"The user wants to find: \"{user_query}\".\n"
-        f"Each tile is labelled with its chip index (e.g. #42). "
-        f"Which single chip index best matches what they are looking for? "
-        f"Reply with ONLY the number, no text."
-    )
-
-    query_idx = None
-    if client:
-        try:
-            resp = client.chat.completions.create(
-                model=ollama_model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": pick_prompt},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/png;base64,{mosaic_b64}"
-                        }},
-                    ]
-                }],
-                max_tokens=10,
-                temperature=0,
-            )
-            raw = resp.choices[0].message.content.strip().replace("#", "")
-            nums = [int(x) for x in raw.split() if x.isdigit()]
-            if nums and 0 <= nums[0] < n_chips:
-                query_idx = nums[0]
-        except Exception as e:
-            log.warning(f"VLM chip selection failed: {e}")
-
-    if query_idx is None:
-        # Fallback: pick the middle chip
-        query_idx = n_chips // 2
-
-    result_indices, result_scores = query_index(faiss_idx, embs, query_idx, top_k)
-
-    # Store for display
-    st.session_state.result_chips  = [chips[i] for i in result_indices]
-    st.session_state.result_scores = result_scores
-    st.session_state.result_indices = result_indices
-    st.session_state.query_chip_idx = query_idx
-
-    # Build result map
-    center = (config.DEFAULT_LAT, config.DEFAULT_LON)
+# -- Shared result store -------------------------------------------------------
+def _store_results(idxs, scores, chip_gdf, chips, spec_reports=None):
+    st.session_state.result_indices=idxs; st.session_state.result_scores=scores
+    st.session_state.result_chips=[chips[i] for i in idxs]
+    st.session_state.result_spectral_reports=spec_reports
+    center=(config.DEFAULT_LAT, config.DEFAULT_LON)
     if chip_gdf is not None and len(chip_gdf):
-        centroid = chip_gdf.dissolve().centroid.iloc[0]
-        center   = (centroid.y, centroid.x)
-    fmap = build_result_map(query_idx, result_indices, result_scores, chip_gdf, center)
-    # Serialize to HTML for display
-    st.session_state.result_map_html = fmap._repr_html_()
+        c=chip_gdf.dissolve().centroid.iloc[0]; center=(c.y, c.x)
+    fmap=build_result_map(idxs[0] if idxs else 0, idxs, scores, chip_gdf, center)
+    st.session_state.result_map_html=fmap._repr_html_()
 
-    # Ask VLM to narrate what was found
-    narration = ""
+# -- Visual search ------------------------------------------------------------
+def run_visual_search(query, item):
+    ensure_indexes(item)
+    chips=st.session_state.chips; embs=st.session_state.embeddings
+    fidx=st.session_state.faiss_idx; chip_gdf=st.session_state.chip_gdf
+    n=len(chips)
+
+    sample_ids=list(range(0, n, max(1, n//16)))[:16]
+    cols_n=4; rows_n=(len(sample_ids)+cols_n-1)//cols_n
+    mosaic=Image.new("RGB",(chip_size*cols_n,(chip_size+24)*rows_n),(20,20,30))
+    draw=ImageDraw.Draw(mosaic)
+    for j,sid in enumerate(sample_ids):
+        rgb=(chips[sid].transpose(1,2,0)*255).astype(np.uint8)
+        r,c=j//cols_n, j%cols_n
+        mosaic.paste(Image.fromarray(rgb),(c*chip_size, r*(chip_size+24)))
+        draw.text((c*chip_size+4, r*(chip_size+24)+chip_size+4),f"#{sid}",fill=(150,200,255))
+    bio=io.BytesIO(); mosaic.save(bio,format="PNG"); bio.seek(0)
+    mb64=base64.b64encode(bio.read()).decode()
+
+    qidx=n//2
+    client=get_client()
     if client:
         try:
-            # Build a small strip of result chips
-            strip_w  = chip_size * min(4, len(result_indices))
-            strip    = Image.new("RGB", (strip_w, chip_size), (20, 20, 30))
-            for k, idx in enumerate(result_indices[:4]):
-                rgb = (chips[idx].transpose(1, 2, 0) * 255).astype(np.uint8)
-                strip.paste(Image.fromarray(rgb), (k * chip_size, 0))
-            strip_io = io.BytesIO()
-            strip.save(strip_io, format="PNG")
-            strip_io.seek(0)
-            strip_b64 = base64.b64encode(strip_io.read()).decode("utf-8")
+            r=client.chat.completions.create(
+                model=ollama_model, max_tokens=10, temperature=0,
+                messages=[{"role":"user","content":[
+                    {"type":"text","text":f'User wants to find: "{query}". Each tile labelled with chip index. Which single index best matches? Reply with ONLY the number.'},
+                    {"type":"image_url","image_url":{"url":f"data:image/png;base64,{mb64}"}},
+                ]}])
+            raw=r.choices[0].message.content.strip().replace("#","")
+            nums=[int(x) for x in raw.split() if x.isdigit()]
+            if nums and 0<=nums[0]<n: qidx=nums[0]
+        except Exception as e: log.warning(f"VLM chip pick: {e}")
 
-            narr_resp = client.chat.completions.create(
-                model=ollama_model,
+    idxs, scores = query_index(fidx, embs, qidx, top_k)
+    _store_results(idxs, scores, chip_gdf, chips)
+
+    narration=f"Found {len(idxs)} visually similar locations."
+    if client:
+        try:
+            strip_n=min(4,len(idxs))
+            strip=Image.new("RGB",(chip_size*strip_n,chip_size),(20,20,30))
+            for k,idx in enumerate(idxs[:strip_n]):
+                strip.paste(Image.fromarray((chips[idx].transpose(1,2,0)*255).astype(np.uint8)),(k*chip_size,0))
+            bio=io.BytesIO(); strip.save(bio,format="PNG"); bio.seek(0)
+            sb64=base64.b64encode(bio.read()).decode()
+            nr=client.chat.completions.create(
+                model=ollama_model, max_tokens=200,
                 messages=[
-                    {"role": "system", "content": config.SEARCH_DESCRIPTION_PROMPT},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": f"The user searched for: \"{user_query}\". Here are the top matching image chips from the aerial scene. Describe what was found in 2-3 sentences."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{strip_b64}"}},
+                    {"role":"system","content":config.SEARCH_DESCRIPTION_PROMPT},
+                    {"role":"user","content":[
+                        {"type":"text","text":f'User searched for: "{query}". Describe top matches in 2-3 sentences.'},
+                        {"type":"image_url","image_url":{"url":f"data:image/png;base64,{sb64}"}},
                     ]},
-                ],
-                max_tokens=200,
-            )
-            narration = narr_resp.choices[0].message.content.strip()
-        except Exception as e:
-            log.warning(f"VLM narration failed: {e}")
-            narration = f"Found {len(result_indices)} locations matching your query. See the map for their positions."
-
+                ])
+            narration=nr.choices[0].message.content.strip()
+        except Exception as e: log.warning(f"Narration: {e}")
     return narration
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CHAT FLOW — conversational VLM analysis
-# ══════════════════════════════════════════════════════════════════════════════
-def run_chat(user_text: str) -> str:
-    client = get_client()
-    if not client:
-        return "⚠️ Ollama credentials not set — add them in the sidebar."
-    if not st.session_state.naip_b64:
-        return "No image loaded yet. Fetch a NAIP tile first using the controls above."
+# -- Spectral search ----------------------------------------------------------
+def run_spectral_search(query, item):
+    ensure_indexes(item)
+    chips4=st.session_state.chips4; sembs=st.session_state.spectral_embs
+    sidx=st.session_state.spectral_idx; chips=st.session_state.chips
+    chip_gdf=st.session_state.chip_gdf
 
-    openai_msgs = [{"role": "system", "content": config.ANALYSIS_SYSTEM_PROMPT}]
-    for i, m in enumerate(st.session_state.messages):
-        if m["role"] == "assistant":
-            openai_msgs.append({"role": "assistant", "content": m["content"]})
+    qvec=concept_to_spectral_vector(query)
+    if qvec is not None:
+        idxs, scores = query_spectral_index(sidx, sembs, qvec, top_k)
+    else:
+        # Ask VLM to map query to a land cover concept
+        client=get_client()
+        qvec=None
+        if client and st.session_state.naip_b64:
+            try:
+                r=client.chat.completions.create(
+                    model=ollama_model, max_tokens=10, temperature=0,
+                    messages=[{"role":"user","content":[
+                        {"type":"text","text":(
+                            f'Query: "{query}". What single land cover concept best describes this? '
+                            f'Reply 1-3 words from: dense vegetation, sparse vegetation, stressed vegetation, '
+                            f'open water, impervious surface, bare soil, urban, agricultural, wetland, '
+                            f'forest, grassland, parking lot, rooftop, high ndvi, low ndvi, high ndwi, '
+                            f'high brightness, low brightness.')},
+                        {"type":"image_url","image_url":{"url":f"data:image/png;base64,{st.session_state.naip_b64}"}},
+                    ]}])
+                concept=r.choices[0].message.content.strip().lower()
+                qvec=concept_to_spectral_vector(concept)
+            except Exception as e: log.warning(f"Concept fallback: {e}")
+        if qvec is not None:
+            idxs, scores = query_spectral_index(sidx, sembs, qvec, top_k)
         else:
-            if i == 0:
-                openai_msgs.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": m["content"]},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/png;base64,{st.session_state.naip_b64}"
-                        }},
-                    ]
-                })
-            else:
-                openai_msgs.append({"role": "user", "content": m["content"]})
+            idxs, scores = query_spectral_by_chip(sidx, sembs, len(chips4)//2, top_k)
 
-    full = ""
-    box  = st.empty()
+    spec_reports=[get_chip_spectral_report(chips4[i]) for i in idxs]
+    _store_results(idxs, scores, chip_gdf, chips, spec_reports=spec_reports)
+
+    report_text="\n".join([
+        f"Chip {i}: NDVI={r['ndvi']:+.3f} ({r['ndvi_class']}), "
+        f"NDWI={r['ndwi']:+.3f} ({r['ndwi_class']}), "
+        f"EVI={r['evi']:+.3f}, Brightness={r['brightness']:.3f}"
+        for i,r in zip(idxs,spec_reports)])
+
+    narration=f"Found {len(idxs)} spectral matches."
+    client=get_client()
+    if client:
+        try:
+            nr=client.chat.completions.create(
+                model=ollama_model, max_tokens=250,
+                messages=[
+                    {"role":"system","content":config.SPECTRAL_DESCRIPTION_PROMPT},
+                    {"role":"user","content":f'Query: "{query}"\n\nTop matches:\n{report_text}\n\nDescribe in 2-3 sentences.'},
+                ])
+            narration=nr.choices[0].message.content.strip()
+        except Exception as e: log.warning(f"Spectral narration: {e}")
+    return narration
+
+# -- Chat ---------------------------------------------------------------------
+def run_chat(text):
+    client=get_client()
+    if not client: return "Add Ollama credentials in the sidebar."
+    if not st.session_state.naip_b64: return "Load a NAIP tile first."
+    msgs=[{"role":"system","content":config.ANALYSIS_SYSTEM_PROMPT}]
+    for i,m in enumerate(st.session_state.messages):
+        if m["role"]=="assistant":
+            msgs.append({"role":"assistant","content":m["content"]})
+        elif i==0:
+            msgs.append({"role":"user","content":[
+                {"type":"text","text":m["content"]},
+                {"type":"image_url","image_url":{"url":f"data:image/png;base64,{st.session_state.naip_b64}"}},
+            ]})
+        else:
+            msgs.append({"role":"user","content":m["content"]})
+    full=""; box=st.empty()
     try:
-        stream = client.chat.completions.create(
-            model=ollama_model, messages=openai_msgs, stream=True,
-        )
+        stream=client.chat.completions.create(model=ollama_model,messages=msgs,stream=True)
         for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            full += delta
-            box.markdown(full + "▌")
+            delta=chunk.choices[0].delta.content or ""
+            full+=delta; box.markdown(full+"▌")
         box.markdown(full)
-    except Exception as e:
-        full = f"⚠️ Model error: {e}"
-        box.markdown(full)
+    except Exception as e: full=f"Model error: {e}"; box.markdown(full)
     return full
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN LAYOUT — image left, chat right
-# ══════════════════════════════════════════════════════════════════════════════
+# -- Layout -------------------------------------------------------------------
 st.markdown("---")
-
 left, right = st.columns([1, 1], gap="large")
 
-# ── LEFT: image + controls ────────────────────────────────────────────────────
 with left:
-    st.markdown("#### 📍 Location")
-    c1, c2, c3 = st.columns([2, 2, 1])
-    with c1:
-        lat = st.number_input("Lat", value=config.DEFAULT_LAT, format="%.4f")
-    with c2:
-        lon = st.number_input("Lon", value=config.DEFAULT_LON, format="%.4f")
-    with c3:
-        buf = st.slider("Buffer °", 0.001, 0.01, 0.003, step=0.001, label_visibility="visible")
+    st.markdown("#### Location")
+    c1,c2,c3=st.columns([2,2,1])
+    with c1: lat=st.number_input("Lat", value=config.DEFAULT_LAT, format="%.4f")
+    with c2: lon=st.number_input("Lon", value=config.DEFAULT_LON, format="%.4f")
+    with c3: buf=st.slider("Buffer",0.001,0.01,0.003,step=0.001)
 
-    fetch_btn = st.button("🛰️ Load NAIP Tile", use_container_width=True)
-
-    if fetch_btn:
-        with st.spinner("Fetching NAIP from Planetary Computer…"):
+    if st.button("Load NAIP Tile", use_container_width=True):
+        with st.spinner("Fetching..."):
             try:
-                img, b64, item = fetch_naip_point(lat, lon, buf)
-                st.session_state.naip_img   = img
-                st.session_state.naip_b64   = b64
-                st.session_state.naip_scene = item
-                st.session_state.messages   = []
-                # Reset search results
-                st.session_state.result_map_html  = None
-                st.session_state.result_chips     = None
-                st.session_state.result_scores    = None
-                st.success(f"Loaded — {img.width}×{img.height} px  ·  {item.datetime.date()}")
-            except Exception as e:
-                st.error(f"Error: {e}")
+                img,b64,item=fetch_naip_point(lat,lon,buf)
+                st.session_state.naip_img=img; st.session_state.naip_b64=b64
+                st.session_state.naip_scene=item; st.session_state.messages=[]
+                st.session_state.result_map_html=None; st.session_state.result_chips=None
+                st.session_state.result_scores=None; st.session_state.result_spectral_reports=None
+                st.success(f"Loaded - {img.width}x{img.height} px - {item.datetime.date()}")
+            except Exception as e: st.error(str(e))
 
-    st.markdown("#### 🗺️ NAIP Imagery")
+    st.markdown("#### NAIP Imagery")
     if st.session_state.naip_img:
         st.image(st.session_state.naip_img, use_container_width=True)
 
-        # Show search result map below the image when available
         if st.session_state.result_map_html:
-            st.markdown("#### 📌 Matching Locations")
-            st.components.v1.html(st.session_state.result_map_html, height=340)
+            st.markdown("#### Matching Locations")
+            components.html(st.session_state.result_map_html, height=300)
 
-            if st.session_state.result_chips:
+            rc=st.session_state.result_chips or []
+            rs=st.session_state.result_scores or []
+            sr=st.session_state.result_spectral_reports
+            n_show=min(len(rc),8)
+            if n_show:
                 st.markdown("**Top matches:**")
-                n_show  = min(len(st.session_state.result_chips), 8)
-                rcols   = st.columns(n_show)
+                rcols=st.columns(n_show)
                 for k in range(n_show):
-                    rgb = (st.session_state.result_chips[k].transpose(1, 2, 0) * 255).astype(np.uint8)
-                    score = st.session_state.result_scores[k]
-                    rcols[k].image(rgb, use_container_width=True)
-                    rcols[k].markdown(
-                        f'<p class="result-chip">{score:.3f}</p>',
-                        unsafe_allow_html=True,
-                    )
+                    rgb=(rc[k].transpose(1,2,0)*255).astype(np.uint8)
+                    rcols[k].image(rgb,use_container_width=True)
+                    rcols[k].markdown(f'<p class="result-chip">{rs[k]:.3f}</p>',unsafe_allow_html=True)
+
+            if sr:
+                st.markdown("#### Spectral Index Summary")
+                for k,r in enumerate(sr[:4]):
+                    bars=(spectral_bar("NDVI",r["ndvi"])+spectral_bar("NDWI",r["ndwi"])+
+                          spectral_bar("EVI",r["evi"])+spectral_bar("Brightness",r["brightness"]*2-1))
+                    st.markdown(
+                        f'<div class="spectral-card">'
+                        f'<div style="font-size:0.72rem;color:#8b949e;font-family:Space Mono,monospace;margin-bottom:6px;">'
+                        f'Match #{k+1} · {r["ndvi_class"]} · {r["ndwi_class"]}</div>'
+                        f'{bars}</div>',unsafe_allow_html=True)
     else:
-        st.info("Enter coordinates above and click **Load NAIP Tile** to begin.")
+        st.info("Enter coordinates and click Load NAIP Tile to begin.")
 
-# ── RIGHT: unified chat ───────────────────────────────────────────────────────
 with right:
-    st.markdown("#### 💬 Ask anything about this image")
-
-    # Render conversation history
+    st.markdown("#### Ask anything about this image")
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            # Intent pill
-            if msg["role"] == "user" and msg.get("intent"):
-                intent = msg["intent"]
-                cls    = "pill-search" if intent == "SEARCH" else "pill-chat"
-                label  = "🔍 SEARCH" if intent == "SEARCH" else "💬 CHAT"
-                st.markdown(
-                    f'<span class="intent-pill {cls}">{label}</span>',
-                    unsafe_allow_html=True,
-                )
+            if msg["role"]=="user" and msg.get("intent"):
+                i=msg["intent"]
+                cls,label=(("pill-spectral","SPECTRAL") if i=="SPECTRAL" else
+                            ("pill-search","SEARCH") if i=="SEARCH" else ("pill-chat","CHAT"))
+                st.markdown(f'<span class="intent-pill {cls}">{label}</span>',unsafe_allow_html=True)
             st.markdown(msg["content"])
 
-    # Chat input
-    placeholder = (
-        "Ask a question or describe what to find…"
-        if st.session_state.naip_img
-        else "Load a NAIP tile first, then ask anything…"
-    )
-    prompt = st.chat_input(
-        placeholder,
-        disabled=(not st.session_state.naip_img),
-    )
+    prompt=st.chat_input(
+        "Ask a question, or describe what to find visually or spectrally...",
+        disabled=(not st.session_state.naip_img))
 
     if prompt:
-        # Classify intent
-        with st.spinner("Routing…"):
-            intent = classify_intent(prompt)
-
-        # Append user message with intent tag
-        st.session_state.messages.append({"role": "user", "content": prompt, "intent": intent})
+        with st.spinner("Routing..."):
+            intent=classify_intent(prompt)
+        st.session_state.messages.append({"role":"user","content":prompt,"intent":intent})
 
         with st.chat_message("user"):
-            cls   = "pill-search" if intent == "SEARCH" else "pill-chat"
-            label = "🔍 SEARCH" if intent == "SEARCH" else "💬 CHAT"
-            st.markdown(
-                f'<span class="intent-pill {cls}">{label}</span>',
-                unsafe_allow_html=True,
-            )
+            cls,label=(("pill-spectral","SPECTRAL") if intent=="SPECTRAL" else
+                        ("pill-search","SEARCH") if intent=="SEARCH" else ("pill-chat","CHAT"))
+            st.markdown(f'<span class="intent-pill {cls}">{label}</span>',unsafe_allow_html=True)
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            if intent == "SEARCH":
-                item = st.session_state.naip_scene
-                if item is None:
-                    response = "No scene loaded. Fetch a NAIP tile first."
-                    st.markdown(response)
+            item=st.session_state.naip_scene
+            if intent=="SPECTRAL":
+                if not item: response="Load a NAIP tile first."; st.markdown(response)
                 else:
-                    with st.spinner(f"🔍 Searching the scene for "{prompt}"…"):
-                        response = run_search(prompt, item)
+                    with st.spinner(f"Running spectral search..."):
+                        response=run_spectral_search(prompt,item)
                     st.markdown(response)
-                    st.markdown("_Matching locations are shown on the map →_")
+                    st.markdown("_Spectral matches and index cards shown on the left_")
+            elif intent=="SEARCH":
+                if not item: response="Load a NAIP tile first."; st.markdown(response)
+                else:
+                    with st.spinner(f"Searching visually..."):
+                        response=run_visual_search(prompt,item)
+                    st.markdown(response)
+                    st.markdown("_Matching locations shown on the map_")
             else:
-                response = run_chat(prompt)
+                response=run_chat(prompt)
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.session_state.messages.append({"role":"assistant","content":response})
         st.rerun()

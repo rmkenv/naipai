@@ -156,3 +156,18 @@ def umap_project(embs: np.ndarray, n_components: int = 2, n_neighbors: int = 15)
         low_memory=True,
     )
     return reducer.fit_transform(embs).astype(np.float32)
+
+
+def query_index_vec(
+    index: faiss.IndexFlatIP,
+    query_vec: np.ndarray,
+    top_k: int,
+) -> tuple[list[int], list[float]]:
+    """
+    Query FAISS index with an arbitrary L2-normalized vector.
+    Used when the query comes from a text description rather than a chip index.
+    """
+    qv = query_vec.reshape(1, -1).astype(np.float32).copy()
+    faiss.normalize_L2(qv)
+    distances, indices = index.search(qv, top_k)
+    return [int(i) for i in indices[0]], [float(s) for s in distances[0]]
