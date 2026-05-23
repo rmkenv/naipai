@@ -1,20 +1,16 @@
 """
 NAIP Intelligence Platform
 ===========================
-Tab 1 — 💬 VLM Chat     : fetch a NAIP tile by lat/lon and chat with Qwen3-VL
-Tab 2 — 🔍 Similarity   : draw an AOI, chip the scene, embed with ResNet-50,
-                           search visually similar locations via FAISS
+One unified interface: ask anything about the imagery.
+  — Describe / analyze / question  →  VLM answers conversationally
+  — Find / locate / search for     →  ResNet-50 + FAISS similarity search
+                                       highlights matching locations on the map
 
 Data: USDA NAIP via Microsoft Planetary Computer
 """
 
-import io
-import sys
-import logging
-import traceback
-import base64
+import io, sys, logging, traceback, base64
 from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
@@ -27,36 +23,26 @@ import rasterio
 from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds
 from PIL import Image
-
+import folium
 from streamlit_folium import st_folium
 
 import config
 from utils.imagery import (
-    search_naip_scenes,
-    load_naip_scene,
-    chip_scene,
-    build_chip_geodataframe,
-    cache_path,
-    save_chips, load_chips,
-    save_meta, load_meta,
+    search_naip_scenes, load_naip_scene, chip_scene,
+    build_chip_geodataframe, cache_path,
+    save_chips, load_chips, save_meta, load_meta,
 )
 from utils.embeddings import (
-    load_model,
-    embed_chips,
-    build_index,
-    query_index,
-    save_index, load_index,
-    save_embeddings, load_embeddings,
-    umap_project,
+    load_model, embed_chips, build_index, query_index,
+    save_index, load_index, save_embeddings, load_embeddings,
 )
-from utils.viz import build_draw_map, build_result_map, build_umap_scatter
+from utils.viz import build_result_map
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("naip_platform")
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=config.APP_TITLE,
     page_icon=config.APP_ICON,
@@ -64,639 +50,514 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Shared styles ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
-
-  html, body, [class*="css"]          { font-family: 'DM Sans', sans-serif; }
-  h1, h2, h3, .mono                  { font-family: 'Space Mono', monospace; }
-  .stApp                             { background: #0d1117; color: #c9d1d9; }
-  div[data-testid="stSidebar"]       { background: #161b22; border-right: 1px solid #21262d; }
-  div[data-testid="stSidebar"] h3    { color: #58a6ff; }
+  html, body, [class*="css"]   { font-family: 'DM Sans', sans-serif; }
+  h1, h2, h3                   { font-family: 'Space Mono', monospace; }
+  .stApp                       { background: #0d1117; color: #c9d1d9; }
+  div[data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #21262d; }
 
   .badge {
     display: inline-block;
     background: #1f6feb22; color: #58a6ff;
-    border: 1px solid #1f6feb55;
-    border-radius: 4px; padding: 2px 10px;
-    font-size: 0.72rem; font-family: 'Space Mono', monospace;
+    border: 1px solid #1f6feb55; border-radius: 4px;
+    padding: 2px 10px; font-size: 0.72rem;
+    font-family: 'Space Mono', monospace;
     letter-spacing: 0.08em; margin-right: 4px;
   }
-  .section-header {
-    font-family: 'Space Mono', monospace;
-    font-size: 0.8rem; letter-spacing: 0.15em;
-    color: #58a6ff; text-transform: uppercase;
-    border-bottom: 1px solid #21262d;
-    padding-bottom: 4px; margin: 1.5rem 0 0.75rem 0;
+  .intent-pill {
+    display: inline-block; border-radius: 12px;
+    padding: 2px 12px; font-size: 0.72rem;
+    font-family: 'Space Mono', monospace; font-weight: 700;
+    letter-spacing: 0.1em; margin-bottom: 6px;
   }
-  .chip-caption {
-    font-size: 0.7rem; color: #8b949e;
-    font-family: 'Space Mono', monospace; text-align: center;
-    margin-top: -8px;
-  }
-  .metric-card {
-    background: #161b22; border: 1px solid #21262d;
-    border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 0.5rem;
-  }
-  .metric-card .val { font-size: 1.4rem; font-weight: 700; color: #e6edf3; }
-  .metric-card .lbl { font-size: 0.72rem; color: #8b949e; }
-
+  .pill-chat   { background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb66; }
+  .pill-search { background: #23863633; color: #3fb950; border: 1px solid #23863666; }
+  .result-chip { text-align: center; font-size: 0.7rem;
+                 color: #8b949e; font-family: 'Space Mono', monospace; }
   .stButton > button {
     background: #21262d; color: #c9d1d9;
     border: 1px solid #30363d; border-radius: 6px;
     font-family: 'Space Mono', monospace; font-size: 0.8rem;
-    transition: all 0.15s ease;
   }
   .stButton > button:hover { background: #238636; color: #fff; border-color: #238636; }
-  div[data-testid="stExpander"] {
-    background: #161b22; border: 1px solid #21262d; border-radius: 8px;
-  }
-  .bbox-display {
-    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
-    padding: 6px 12px; font-family: 'Space Mono', monospace;
-    font-size: 0.75rem; color: #58a6ff; margin-top: 6px;
+  .hint-box {
+    background: #161b22; border: 1px solid #21262d;
+    border-radius: 8px; padding: 10px 16px;
+    font-size: 0.8rem; color: #8b949e; margin-bottom: 12px;
   }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ─────────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("# 🛰️ NAIP Intelligence Platform")
 st.markdown(
     '<span class="badge">PLANETARY COMPUTER</span>'
     '<span class="badge">QWEN3-VL</span>'
-    '<span class="badge">RESNET-50</span>'
-    '<span class="badge">FAISS COSINE</span>'
-    '<span class="badge">OPEN SOURCE</span>',
+    '<span class="badge">RESNET-50 · FAISS</span>'
+    '<span class="badge">NYC DEFAULT</span>',
     unsafe_allow_html=True,
 )
-st.markdown("---")
+
+# ── Session state init ────────────────────────────────────────────────────────
+DEFAULTS = {
+    "naip_img": None, "naip_b64": None, "naip_scene": None,
+    "messages": [],
+    "chips": None, "positions": None, "embeddings": None,
+    "faiss_idx": None, "chip_gdf": None, "scene_id": None,
+    "last_bbox": None,
+    "result_map_html": None, "result_chips": None, "result_scores": None,
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SHARED SIDEBAR — credentials + common settings
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
 
-    # --- Ollama credentials (used by Chat tab) ---
-    st.markdown('<p class="section-header">Ollama Cloud</p>', unsafe_allow_html=True)
-
-    # Prefer st.secrets, fall back to config defaults (env vars)
     def _secret(key, default=""):
-        try:
-            return st.secrets[key]
-        except Exception:
-            return default
+        try:    return st.secrets[key]
+        except: return default
 
-    ollama_host  = st.text_input("Host URL",  value=_secret("OLLAMA_HOST",  config.OLLAMA_HOST_DEFAULT),  type="default")
-    ollama_key   = st.text_input("API Key",   value=_secret("OLLAMA_API_KEY", config.OLLAMA_KEY_DEFAULT), type="password")
-    ollama_model = st.text_input("Model",     value=_secret("OLLAMA_MODEL",  config.OLLAMA_MODEL_DEFAULT))
+    ollama_host  = st.text_input("Ollama Host",  value=_secret("OLLAMA_HOST",  config.OLLAMA_HOST_DEFAULT))
+    ollama_key   = st.text_input("API Key",       value=_secret("OLLAMA_API_KEY", config.OLLAMA_KEY_DEFAULT), type="password")
+    ollama_model = st.text_input("Model",         value=_secret("OLLAMA_MODEL",  config.OLLAMA_MODEL_DEFAULT))
 
     st.markdown("---")
-    st.caption(
-        "Data: USDA NAIP via Microsoft Planetary Computer  \n"
-        "Chat model: Ollama Cloud VLM  \n"
-        "Embed model: ResNet-50 (ImageNet)  \n"
-        "Index: FAISS IndexFlatIP (cosine)"
+    st.markdown("**Scene settings**")
+    year      = st.selectbox("NAIP Year", config.NAIP_YEARS, index=2)
+    chip_size = st.select_slider("Chip size (px)", [112, 224, 336], value=224)
+    top_k     = st.slider("Results to find", 3, 20, config.DEFAULT_TOP_K)
+
+    st.markdown("---")
+    st.markdown("**How to use**")
+    st.markdown("""
+<div class="hint-box">
+Ask anything in the chat below.<br><br>
+<b>To analyze:</b> "What land cover types are present?" or "Describe the road network."<br><br>
+<b>To find:</b> "Find all parking lots" or "Locate green spaces" or "Show me rooftops."
+</div>
+""", unsafe_allow_html=True)
+
+    st.caption("Data: USDA NAIP via Planetary Computer")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OLLAMA CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
+def get_client():
+    if not ollama_host or not ollama_key:
+        return None
+    return OpenAI(
+        base_url=f"{ollama_host.rstrip('/')}/v1",
+        api_key=ollama_key,
     )
 
+def classify_intent(user_text: str) -> str:
+    """Returns 'CHAT' or 'SEARCH'."""
+    client = get_client()
+    if not client:
+        return "CHAT"
+    try:
+        resp = client.chat.completions.create(
+            model=ollama_model,
+            messages=[
+                {"role": "system", "content": config.INTENT_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_text},
+            ],
+            max_tokens=5,
+            temperature=0,
+        )
+        word = resp.choices[0].message.content.strip().upper()
+        return "SEARCH" if "SEARCH" in word else "CHAT"
+    except Exception:
+        return "CHAT"
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TABS
+# NAIP FETCH (point + buffer → RGB chip)
 # ══════════════════════════════════════════════════════════════════════════════
-tab_chat, tab_sim = st.tabs(["💬 VLM Chat", "🔍 Similarity Search"])
+def fetch_naip_point(lat, lon, buf=0.003):
+    catalog = pystac_client.Client.open(config.PC_STAC_URL, modifier=pc.sign_inplace)
+    bbox = [lon - buf, lat - buf, lon + buf, lat + buf]
+    results = catalog.search(
+        collections=[config.NAIP_COLLECTION], bbox=bbox,
+        limit=1, sortby="-properties.datetime",
+    )
+    items = list(results.items())
+    if not items:
+        raise ValueError("No NAIP scenes found at this location.")
 
+    item = items[0]
+    href = item.assets["image"].href
+    with rasterio.open(href) as src:
+        bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
+        window = from_bounds(*bounds, transform=src.transform)
+        data   = src.read([1, 2, 3], window=window)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 1 — VLM CHAT  (ported from naipchat)
-# ─────────────────────────────────────────────────────────────────────────────
-with tab_chat:
-    st.markdown('<p class="section-header">00 · Area of Interest</p>', unsafe_allow_html=True)
+    data = np.moveaxis(data, 0, -1)
+    data = np.clip(data, 0, 255).astype(np.uint8)
+    img  = Image.fromarray(data)
 
-    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+    buf_io = io.BytesIO()
+    img.save(buf_io, format="PNG")
+    buf_io.seek(0)
+    b64 = base64.b64encode(buf_io.read()).decode("utf-8")
+    return img, b64, item
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMBEDDING INDEX (build or load from cache)
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner=False)
+def _load_resnet():
+    return load_model()
+
+def ensure_index(item, stride):
+    scene_id = item.id
+    if st.session_state.scene_id == scene_id and st.session_state.faiss_idx is not None:
+        return  # already built for this scene
+
+    chips_path = cache_path(scene_id, chip_size, stride, "_chips.npy")
+    embs_path  = cache_path(scene_id, chip_size, stride, "_embeddings.npy")
+    idx_path   = cache_path(scene_id, chip_size, stride, "_faiss.index")
+    meta_path  = cache_path(scene_id, chip_size, stride, "_meta.pkl")
+    cached     = all(p.exists() for p in [chips_path, embs_path, idx_path, meta_path])
+
+    if cached:
+        chips     = load_chips(chips_path)
+        embs      = load_embeddings(embs_path)
+        faiss_idx = load_index(idx_path)
+        meta      = load_meta(meta_path)
+    else:
+        with st.spinner("📥 Loading full NAIP scene for indexing…"):
+            ds, _ = load_naip_scene(item)
+
+        with st.spinner(f"✂️ Chipping scene into {chip_size}px tiles…"):
+            chips, positions = chip_scene(ds, chip_size=chip_size, stride=stride)
+
+        with st.spinner("📐 Building chip GeoDataFrame…"):
+            chip_gdf = build_chip_geodataframe(positions, ds, chip_size)
+
+        model, device = _load_resnet()
+        prog = st.progress(0.0, text="🧠 Embedding chips…")
+
+        def _cb(done, total):
+            prog.progress(done / total, text=f"🧠 Embedding {done}/{total}…")
+
+        embs = embed_chips(chips, model, device, progress_callback=_cb)
+        prog.empty()
+
+        faiss_idx = build_index(embs)
+
+        save_chips(chips, chips_path)
+        save_embeddings(embs, embs_path)
+        save_index(faiss_idx, idx_path)
+        save_meta({"positions": positions, "chip_gdf": chip_gdf}, meta_path)
+
+        meta = {"positions": positions, "chip_gdf": chip_gdf}
+
+    st.session_state.chips      = chips
+    st.session_state.positions  = meta["positions"]
+    st.session_state.embeddings = embs
+    st.session_state.faiss_idx  = faiss_idx
+    st.session_state.chip_gdf   = meta["chip_gdf"]
+    st.session_state.scene_id   = scene_id
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEARCH FLOW — find visually similar chips using a description
+# ══════════════════════════════════════════════════════════════════════════════
+def run_search(user_query: str, item) -> str:
+    stride = int(chip_size * 0.5)
+    ensure_index(item, stride)
+
+    chips     = st.session_state.chips
+    embs      = st.session_state.embeddings
+    faiss_idx = st.session_state.faiss_idx
+    chip_gdf  = st.session_state.chip_gdf
+    n_chips   = len(chips)
+
+    # Ask the VLM: "which chip index best represents '<query>'?"
+    # Build a 4x4 sample mosaic of chips with their indices labelled,
+    # then ask the model to pick the best starting chip.
+    sample_n   = min(16, n_chips)
+    step       = max(1, n_chips // sample_n)
+    sample_ids = list(range(0, n_chips, step))[:sample_n]
+
+    # Build a labelled mosaic image
+    cols_per_row = 4
+    rows_count   = (len(sample_ids) + cols_per_row - 1) // cols_per_row
+    mosaic_w     = chip_size * cols_per_row
+    mosaic_h     = chip_size * rows_count + 24 * rows_count  # room for labels
+    mosaic       = Image.new("RGB", (mosaic_w, mosaic_h + 24), (20, 20, 30))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(mosaic)
+
+    for j, sid in enumerate(sample_ids):
+        row_j = j // cols_per_row
+        col_j = j % cols_per_row
+        rgb   = (chips[sid].transpose(1, 2, 0) * 255).astype(np.uint8)
+        chip_img = Image.fromarray(rgb)
+        x = col_j * chip_size
+        y = row_j * (chip_size + 24)
+        mosaic.paste(chip_img, (x, y))
+        draw.text((x + 4, y + chip_size + 4), f"#{sid}", fill=(150, 200, 255))
+
+    mosaic_io = io.BytesIO()
+    mosaic.save(mosaic_io, format="PNG")
+    mosaic_io.seek(0)
+    mosaic_b64 = base64.b64encode(mosaic_io.read()).decode("utf-8")
+
+    client = get_client()
+    pick_prompt = (
+        f"The user wants to find: \"{user_query}\".\n"
+        f"Each tile is labelled with its chip index (e.g. #42). "
+        f"Which single chip index best matches what they are looking for? "
+        f"Reply with ONLY the number, no text."
+    )
+
+    query_idx = None
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model=ollama_model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": pick_prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{mosaic_b64}"
+                        }},
+                    ]
+                }],
+                max_tokens=10,
+                temperature=0,
+            )
+            raw = resp.choices[0].message.content.strip().replace("#", "")
+            nums = [int(x) for x in raw.split() if x.isdigit()]
+            if nums and 0 <= nums[0] < n_chips:
+                query_idx = nums[0]
+        except Exception as e:
+            log.warning(f"VLM chip selection failed: {e}")
+
+    if query_idx is None:
+        # Fallback: pick the middle chip
+        query_idx = n_chips // 2
+
+    result_indices, result_scores = query_index(faiss_idx, embs, query_idx, top_k)
+
+    # Store for display
+    st.session_state.result_chips  = [chips[i] for i in result_indices]
+    st.session_state.result_scores = result_scores
+    st.session_state.result_indices = result_indices
+    st.session_state.query_chip_idx = query_idx
+
+    # Build result map
+    center = (config.DEFAULT_LAT, config.DEFAULT_LON)
+    if chip_gdf is not None and len(chip_gdf):
+        centroid = chip_gdf.dissolve().centroid.iloc[0]
+        center   = (centroid.y, centroid.x)
+    fmap = build_result_map(query_idx, result_indices, result_scores, chip_gdf, center)
+    # Serialize to HTML for display
+    st.session_state.result_map_html = fmap._repr_html_()
+
+    # Ask VLM to narrate what was found
+    narration = ""
+    if client:
+        try:
+            # Build a small strip of result chips
+            strip_w  = chip_size * min(4, len(result_indices))
+            strip    = Image.new("RGB", (strip_w, chip_size), (20, 20, 30))
+            for k, idx in enumerate(result_indices[:4]):
+                rgb = (chips[idx].transpose(1, 2, 0) * 255).astype(np.uint8)
+                strip.paste(Image.fromarray(rgb), (k * chip_size, 0))
+            strip_io = io.BytesIO()
+            strip.save(strip_io, format="PNG")
+            strip_io.seek(0)
+            strip_b64 = base64.b64encode(strip_io.read()).decode("utf-8")
+
+            narr_resp = client.chat.completions.create(
+                model=ollama_model,
+                messages=[
+                    {"role": "system", "content": config.SEARCH_DESCRIPTION_PROMPT},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"The user searched for: \"{user_query}\". Here are the top matching image chips from the aerial scene. Describe what was found in 2-3 sentences."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{strip_b64}"}},
+                    ]},
+                ],
+                max_tokens=200,
+            )
+            narration = narr_resp.choices[0].message.content.strip()
+        except Exception as e:
+            log.warning(f"VLM narration failed: {e}")
+            narration = f"Found {len(result_indices)} locations matching your query. See the map for their positions."
+
+    return narration
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHAT FLOW — conversational VLM analysis
+# ══════════════════════════════════════════════════════════════════════════════
+def run_chat(user_text: str) -> str:
+    client = get_client()
+    if not client:
+        return "⚠️ Ollama credentials not set — add them in the sidebar."
+    if not st.session_state.naip_b64:
+        return "No image loaded yet. Fetch a NAIP tile first using the controls above."
+
+    openai_msgs = [{"role": "system", "content": config.ANALYSIS_SYSTEM_PROMPT}]
+    for i, m in enumerate(st.session_state.messages):
+        if m["role"] == "assistant":
+            openai_msgs.append({"role": "assistant", "content": m["content"]})
+        else:
+            if i == 0:
+                openai_msgs.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": m["content"]},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{st.session_state.naip_b64}"
+                        }},
+                    ]
+                })
+            else:
+                openai_msgs.append({"role": "user", "content": m["content"]})
+
+    full = ""
+    box  = st.empty()
+    try:
+        stream = client.chat.completions.create(
+            model=ollama_model, messages=openai_msgs, stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            full += delta
+            box.markdown(full + "▌")
+        box.markdown(full)
+    except Exception as e:
+        full = f"⚠️ Model error: {e}"
+        box.markdown(full)
+    return full
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN LAYOUT — image left, chat right
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+
+left, right = st.columns([1, 1], gap="large")
+
+# ── LEFT: image + controls ────────────────────────────────────────────────────
+with left:
+    st.markdown("#### 📍 Location")
+    c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        lat = st.number_input("Latitude",  value=config.DEFAULT_LAT, format="%.4f", key="chat_lat")
+        lat = st.number_input("Lat", value=config.DEFAULT_LAT, format="%.4f")
     with c2:
-        lon = st.number_input("Longitude", value=config.DEFAULT_LON, format="%.4f", key="chat_lon")
+        lon = st.number_input("Lon", value=config.DEFAULT_LON, format="%.4f")
     with c3:
-        buf = st.slider("Buffer (°)", 0.001, 0.01, 0.003, step=0.001, key="chat_buf")
-    with c4:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        fetch_btn = st.button("🔍 Fetch NAIP Tile", key="chat_fetch")
+        buf = st.slider("Buffer °", 0.001, 0.01, 0.003, step=0.001, label_visibility="visible")
 
-    system_prompt = st.expander("🧠 System Prompt (click to edit)", expanded=False)
-    with system_prompt:
-        sys_prompt_val = st.text_area(
-            label="system_prompt",
-            label_visibility="collapsed",
-            height=180,
-            value=config.DEFAULT_SYSTEM_PROMPT,
-            key="chat_sysprompt",
-        )
-
-    # ── NAIP fetch ────────────────────────────────────────────────────────────
-    def fetch_naip_chat(lat, lon, buf):
-        catalog = pystac_client.Client.open(
-            config.PC_STAC_URL,
-            modifier=pc.sign_inplace,
-        )
-        bbox = [lon - buf, lat - buf, lon + buf, lat + buf]
-        results = catalog.search(
-            collections=[config.NAIP_COLLECTION],
-            bbox=bbox,
-            limit=1,
-            sortby="-properties.datetime",
-        )
-        items = list(results.items())
-        if not items:
-            raise ValueError("No NAIP tiles found for this location.")
-
-        href = items[0].assets["image"].href
-        with rasterio.open(href) as src:
-            bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
-            window = from_bounds(*bounds, transform=src.transform)
-            data = src.read([1, 2, 3], window=window)
-
-        data = np.moveaxis(data, 0, -1)
-        data = np.clip(data, 0, 255).astype(np.uint8)
-        img = Image.fromarray(data)
-
-        buf_io = io.BytesIO()
-        img.save(buf_io, format="PNG")
-        buf_io.seek(0)
-        b64 = base64.b64encode(buf_io.read()).decode("utf-8")
-        return img, b64
-
-    # ── Session state ─────────────────────────────────────────────────────────
-    for k, v in [("chat_messages", []), ("chat_img", None), ("chat_b64", None)]:
-        if k not in st.session_state:
-            st.session_state[k] = v
+    fetch_btn = st.button("🛰️ Load NAIP Tile", use_container_width=True)
 
     if fetch_btn:
         with st.spinner("Fetching NAIP from Planetary Computer…"):
             try:
-                img, b64 = fetch_naip_chat(lat, lon, buf)
-                st.session_state.chat_img = img
-                st.session_state.chat_b64 = b64
-                st.session_state.chat_messages = []
-                st.success(f"Loaded — {img.width}×{img.height} px")
+                img, b64, item = fetch_naip_point(lat, lon, buf)
+                st.session_state.naip_img   = img
+                st.session_state.naip_b64   = b64
+                st.session_state.naip_scene = item
+                st.session_state.messages   = []
+                # Reset search results
+                st.session_state.result_map_html  = None
+                st.session_state.result_chips     = None
+                st.session_state.result_scores    = None
+                st.success(f"Loaded — {img.width}×{img.height} px  ·  {item.datetime.date()}")
             except Exception as e:
                 st.error(f"Error: {e}")
 
-    # ── Layout ────────────────────────────────────────────────────────────────
-    st.markdown('<p class="section-header">01 · Image & Conversation</p>', unsafe_allow_html=True)
-    img_col, chat_col = st.columns([1, 1])
+    st.markdown("#### 🗺️ NAIP Imagery")
+    if st.session_state.naip_img:
+        st.image(st.session_state.naip_img, use_container_width=True)
 
-    with img_col:
-        st.subheader("🗺️ NAIP Tile")
-        if st.session_state.chat_img:
-            st.image(st.session_state.chat_img, use_container_width=True)
-        else:
-            st.info("Enter coordinates above and click **Fetch NAIP Tile**.")
+        # Show search result map below the image when available
+        if st.session_state.result_map_html:
+            st.markdown("#### 📌 Matching Locations")
+            st.components.v1.html(st.session_state.result_map_html, height=340)
 
-    with chat_col:
-        st.subheader("💬 Ask the VLM")
+            if st.session_state.result_chips:
+                st.markdown("**Top matches:**")
+                n_show  = min(len(st.session_state.result_chips), 8)
+                rcols   = st.columns(n_show)
+                for k in range(n_show):
+                    rgb = (st.session_state.result_chips[k].transpose(1, 2, 0) * 255).astype(np.uint8)
+                    score = st.session_state.result_scores[k]
+                    rcols[k].image(rgb, use_container_width=True)
+                    rcols[k].markdown(
+                        f'<p class="result-chip">{score:.3f}</p>',
+                        unsafe_allow_html=True,
+                    )
+    else:
+        st.info("Enter coordinates above and click **Load NAIP Tile** to begin.")
 
-        for msg in st.session_state.chat_messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+# ── RIGHT: unified chat ───────────────────────────────────────────────────────
+with right:
+    st.markdown("#### 💬 Ask anything about this image")
 
-        if prompt := st.chat_input(
-            "Ask about this image…",
-            disabled=not st.session_state.chat_b64,
-            key="chat_input",
-        ):
-            st.session_state.chat_messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            if not ollama_host or not ollama_key:
-                st.error("Set Ollama Host and API Key in the sidebar.")
-            else:
-                client = OpenAI(
-                    base_url=f"{ollama_host.rstrip('/')}/v1",
-                    api_key=ollama_key,
+    # Render conversation history
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            # Intent pill
+            if msg["role"] == "user" and msg.get("intent"):
+                intent = msg["intent"]
+                cls    = "pill-search" if intent == "SEARCH" else "pill-chat"
+                label  = "🔍 SEARCH" if intent == "SEARCH" else "💬 CHAT"
+                st.markdown(
+                    f'<span class="intent-pill {cls}">{label}</span>',
+                    unsafe_allow_html=True,
                 )
+            st.markdown(msg["content"])
 
-                # Build message list: image injected on first user turn only
-                openai_msgs = [{"role": "system", "content": sys_prompt_val}]
-                for i, m in enumerate(st.session_state.chat_messages):
-                    if i == 0:
-                        openai_msgs.append({
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": m["content"]},
-                                {"type": "image_url", "image_url": {
-                                    "url": f"data:image/png;base64,{st.session_state.chat_b64}"
-                                }},
-                            ],
-                        })
-                    else:
-                        openai_msgs.append({"role": m["role"], "content": m["content"]})
+    # Chat input
+    placeholder = (
+        "Ask a question or describe what to find…"
+        if st.session_state.naip_img
+        else "Load a NAIP tile first, then ask anything…"
+    )
+    prompt = st.chat_input(
+        placeholder,
+        disabled=(not st.session_state.naip_img),
+    )
 
-                with st.chat_message("assistant"):
-                    box = st.empty()
-                    full = ""
-                    try:
-                        stream = client.chat.completions.create(
-                            model=ollama_model,
-                            messages=openai_msgs,
-                            stream=True,
-                        )
-                        for chunk in stream:
-                            delta = chunk.choices[0].delta.content or ""
-                            full += delta
-                            box.markdown(full + "▌")
-                        box.markdown(full)
-                    except Exception as e:
-                        st.error(f"Model error: {e}")
+    if prompt:
+        # Classify intent
+        with st.spinner("Routing…"):
+            intent = classify_intent(prompt)
 
-                st.session_state.chat_messages.append({"role": "assistant", "content": full})
+        # Append user message with intent tag
+        st.session_state.messages.append({"role": "user", "content": prompt, "intent": intent})
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TAB 2 — SIMILARITY SEARCH  (ported from openembed)
-# ─────────────────────────────────────────────────────────────────────────────
-with tab_sim:
-
-    # ── Sub-sidebar params injected inline ───────────────────────────────────
-    sim_col_main, sim_col_ctrl = st.columns([4, 1])
-
-    with sim_col_ctrl:
-        st.markdown("**Imagery**")
-        year = st.selectbox("NAIP Year", config.NAIP_YEARS, index=2, key="sim_year")
-
-        st.markdown("**Chipping**")
-        chip_size   = st.select_slider("Chip size (px)", [112, 224, 336], value=224, key="sim_chip")
-        stride_frac = st.slider("Stride (fraction)", 0.25, 1.0, 0.5, 0.25, key="sim_stride")
-        stride      = int(chip_size * stride_frac)
-
-        st.markdown("**Search**")
-        top_k     = st.slider("Top-K", 3, 20, config.DEFAULT_TOP_K, key="sim_topk")
-        show_umap = st.checkbox("Show UMAP", value=True, key="sim_umap")
-
-        # Session state init
-        _SIM_KEYS = ["sim_scenes", "sim_selected", "sim_ds", "sim_chips",
-                     "sim_positions", "sim_embeddings", "sim_faiss",
-                     "sim_chip_gdf", "sim_query_idx", "sim_results",
-                     "sim_umap_proj", "sim_bbox", "sim_scene_id"]
-        for k in _SIM_KEYS:
-            if k not in st.session_state:
-                st.session_state[k] = None
-
-        if st.session_state.sim_bbox:
-            w, s, e, n = st.session_state.sim_bbox
+        with st.chat_message("user"):
+            cls   = "pill-search" if intent == "SEARCH" else "pill-chat"
+            label = "🔍 SEARCH" if intent == "SEARCH" else "💬 CHAT"
             st.markdown(
-                f'<div class="bbox-display">W {w:.4f}  E {e:.4f}<br>S {s:.4f}  N {n:.4f}</div>',
+                f'<span class="intent-pill {cls}">{label}</span>',
                 unsafe_allow_html=True,
             )
-            if (e - w) * (n - s) > 0.5:
-                st.warning("⚠️ Large AOI")
-        else:
-            st.caption("🖊️ Draw a rectangle on the map.")
+            st.markdown(prompt)
 
-        search_btn = st.button("🔍 Search Scenes",  use_container_width=True,
-                               disabled=(st.session_state.sim_bbox is None), key="sim_search")
-        build_btn  = st.button("⚙️ Build Index",    use_container_width=True,
-                               disabled=(st.session_state.sim_scenes is None), key="sim_build")
-
-    with sim_col_main:
-        # ── Step 0: Draw AOI ──────────────────────────────────────────────────
-        st.markdown('<p class="section-header">00 · Draw Your Area of Interest</p>',
-                    unsafe_allow_html=True)
-        st.caption("Use the rectangle tool (top-left) to draw your AOI, then click **Search Scenes**.")
-
-        if st.session_state.sim_bbox:
-            w, s, e, n = st.session_state.sim_bbox
-            map_center = ((s + n) / 2, (w + e) / 2)
-            map_zoom   = 12
-        else:
-            db = config.DEFAULT_BBOX
-            map_center = (
-                db["south"] + (db["north"] - db["south"]) / 2,
-                db["west"]  + (db["east"]  - db["west"])  / 2,
-            )
-            map_zoom = 10
-
-        draw_map = build_draw_map(
-            center=map_center,
-            zoom=map_zoom,
-            existing_bbox=st.session_state.sim_bbox,
-        )
-        map_data = st_folium(draw_map, width="100%", height=400,
-                             returned_objects=["all_drawings"], key="sim_aoi_map")
-
-        # Parse drawn rectangle
-        def _extract_bbox(md):
-            try:
-                drawings = md.get("all_drawings") or []
-                if not drawings:
-                    return None
-                geom = drawings[-1].get("geometry", {})
-                if geom.get("type") != "Polygon":
-                    return None
-                coords = geom["coordinates"][0]
-                lngs = [c[0] for c in coords]
-                lats = [c[1] for c in coords]
-                return [min(lngs), min(lats), max(lngs), max(lats)]
-            except Exception:
-                return None
-
-        drawn = _extract_bbox(map_data)
-        if drawn:
-            w, s, e, n = drawn
-            if (e - w) > 0 and (n - s) > 0 and drawn != st.session_state.sim_bbox:
-                st.session_state.sim_bbox = drawn
-                for k in ["sim_scenes", "sim_selected", "sim_ds", "sim_chips",
-                          "sim_positions", "sim_embeddings", "sim_faiss",
-                          "sim_chip_gdf", "sim_query_idx", "sim_results",
-                          "sim_umap_proj", "sim_scene_id"]:
-                    st.session_state[k] = None
-                st.rerun()
-
-        if st.session_state.sim_bbox:
-            w, s, e, n = st.session_state.sim_bbox
-            st.success(f"✅ AOI — W:{w:.4f} S:{s:.4f} E:{e:.4f} N:{n:.4f}")
-        else:
-            st.info("No AOI drawn yet.")
-
-    # ── Step 1: Scene search ──────────────────────────────────────────────────
-    if search_btn:
-        bbox = st.session_state.sim_bbox
-        if not bbox:
-            st.error("Draw an AOI first.")
-            st.stop()
-        with st.spinner("📡 Querying Planetary Computer STAC…"):
-            try:
-                scenes = search_naip_scenes(bbox, year)
-            except Exception as e:
-                st.error(f"STAC search failed: {e}")
-                log.error(traceback.format_exc())
-                st.stop()
-        if not scenes:
-            st.error(f"No NAIP scenes found for this AOI in {year}. Try a different year or larger extent.")
-            st.stop()
-        st.session_state.sim_scenes = scenes
-        for k in ["sim_ds", "sim_chips", "sim_positions", "sim_embeddings", "sim_faiss",
-                  "sim_chip_gdf", "sim_query_idx", "sim_results", "sim_umap_proj", "sim_scene_id"]:
-            st.session_state[k] = None
-        st.success(f"Found **{len(scenes)}** scene(s). Select one below and click **Build Index**.")
-
-    # ── Scene picker ──────────────────────────────────────────────────────────
-    if st.session_state.sim_scenes:
-        st.markdown('<p class="section-header">01 · Select Scene</p>', unsafe_allow_html=True)
-        labels = [
-            f"{i+1}. {s.id}  |  {s.datetime.date() if s.datetime else 'n/a'}"
-            for i, s in enumerate(st.session_state.sim_scenes)
-        ]
-        sel = st.radio("Scenes", labels, label_visibility="collapsed", key="sim_radio")
-        st.session_state.sim_selected = st.session_state.sim_scenes[labels.index(sel)]
-
-        item = st.session_state.sim_selected
-        with st.expander("Scene metadata"):
-            st.dataframe(pd.DataFrame({
-                "Field": ["ID", "Date", "CRS", "Cloud Cover", "State"],
-                "Value": [
-                    item.id,
-                    str(item.datetime.date()) if item.datetime else "n/a",
-                    item.properties.get("proj:epsg", "n/a"),
-                    item.properties.get("eo:cloud_cover", "n/a"),
-                    item.properties.get("naip:state", "n/a"),
-                ],
-            }), use_container_width=True, hide_index=True)
-
-    # ── Cached model ──────────────────────────────────────────────────────────
-    @st.cache_resource(show_spinner=False)
-    def _load_resnet():
-        return load_model()
-
-    # ── Step 2: Build index ───────────────────────────────────────────────────
-    if build_btn and st.session_state.sim_selected is not None:
-        item     = st.session_state.sim_selected
-        scene_id = item.id
-
-        chips_path = cache_path(scene_id, chip_size, stride, "_chips.npy")
-        embs_path  = cache_path(scene_id, chip_size, stride, "_embeddings.npy")
-        idx_path   = cache_path(scene_id, chip_size, stride, "_faiss.index")
-        meta_path  = cache_path(scene_id, chip_size, stride, "_meta.pkl")
-        cache_hit  = all(p.exists() for p in [chips_path, embs_path, idx_path, meta_path])
-
-        if cache_hit:
-            st.info("💾 Loading from disk cache…")
-            chips     = load_chips(chips_path)
-            embs      = load_embeddings(embs_path)
-            faiss_idx = load_index(idx_path)
-            cached    = load_meta(meta_path)
-            positions = cached["positions"]
-            chip_gdf  = cached["chip_gdf"]
-        else:
-            with st.spinner("📥 Loading NAIP COG…"):
-                try:
-                    ds, ov_level = load_naip_scene(item)
-                except Exception as e:
-                    st.error(f"Failed to load imagery: {e}")
-                    log.error(traceback.format_exc())
-                    st.stop()
-
-            st.success(f"Loaded `{scene_id}` — {ds.shape[1]}×{ds.shape[2]} px (overview {ov_level})")
-
-            with st.spinner("✂️ Chipping imagery…"):
-                chips, positions = chip_scene(ds, chip_size=chip_size, stride=stride)
-
-            if len(chips) == 0:
-                st.error("No chips generated — AOI may be smaller than one chip. Reduce chip size or draw a larger AOI.")
-                st.stop()
-            if len(chips) >= config.MAX_CHIPS:
-                st.warning(f"⚠️ Chip count capped at {config.MAX_CHIPS}.")
-
-            st.info(f"Generated **{len(chips)}** chips  ({chip_size}px, stride {stride}px)")
-
-            with st.spinner("📐 Building chip GeoDataFrame…"):
-                chip_gdf = build_chip_geodataframe(positions, ds, chip_size)
-
-            model, device = _load_resnet()
-            progress_bar  = st.progress(0.0, text="🧠 Embedding chips…")
-
-            def _cb(done, total):
-                progress_bar.progress(done / total, text=f"🧠 {done}/{total} chips…")
-
-            try:
-                embs = embed_chips(chips, model, device, progress_callback=_cb)
-            except Exception as e:
-                st.error(f"Embedding failed: {e}")
-                log.error(traceback.format_exc())
-                st.stop()
-            finally:
-                progress_bar.empty()
-
-            with st.spinner("🗂️ Building FAISS index…"):
-                faiss_idx = build_index(embs)
-
-            with st.spinner("💾 Saving to cache…"):
-                save_chips(chips, chips_path)
-                save_embeddings(embs, embs_path)
-                save_index(faiss_idx, idx_path)
-                save_meta({"positions": positions, "chip_gdf": chip_gdf}, meta_path)
-
-        st.session_state.sim_chips      = chips
-        st.session_state.sim_positions  = positions
-        st.session_state.sim_embeddings = embs
-        st.session_state.sim_faiss      = faiss_idx
-        st.session_state.sim_chip_gdf   = chip_gdf
-        st.session_state.sim_scene_id   = scene_id
-        st.session_state.sim_query_idx  = None
-        st.session_state.sim_results    = None
-        st.session_state.sim_umap_proj  = None
-
-        mc = st.columns(4)
-        mc[0].markdown(f'<div class="metric-card"><div class="val">{len(chips):,}</div><div class="lbl">Chips</div></div>', unsafe_allow_html=True)
-        mc[1].markdown(f'<div class="metric-card"><div class="val">{embs.shape[1]:,}</div><div class="lbl">Embed dim</div></div>', unsafe_allow_html=True)
-        mc[2].markdown(f'<div class="metric-card"><div class="val">{chip_size}px</div><div class="lbl">Chip size</div></div>', unsafe_allow_html=True)
-        mc[3].markdown(f'<div class="metric-card"><div class="val">{"cache ✓" if cache_hit else "fresh"}</div><div class="lbl">Source</div></div>', unsafe_allow_html=True)
-
-    # ── Step 3: Query ─────────────────────────────────────────────────────────
-    if st.session_state.sim_chips is not None:
-        chips     = st.session_state.sim_chips
-        n_chips   = len(chips)
-        embs      = st.session_state.sim_embeddings
-        faiss_idx = st.session_state.sim_faiss
-        chip_gdf  = st.session_state.sim_chip_gdf
-
-        st.markdown("---")
-        st.markdown('<p class="section-header">02 · Select Query Chip</p>', unsafe_allow_html=True)
-
-        qc1, qc2, qc3 = st.columns([2, 1, 3])
-        with qc1:
-            current_q = st.session_state.sim_query_idx if st.session_state.sim_query_idx is not None else 0
-            query_idx = st.number_input(
-                f"Chip index (0–{n_chips - 1})",
-                min_value=0, max_value=n_chips - 1,
-                value=current_q, step=1, key="sim_q_input",
-            )
-        with qc2:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            if st.button("🎲 Random", key="sim_random"):
-                st.session_state.sim_query_idx = int(np.random.randint(0, n_chips))
-                st.rerun()
-        with qc3:
-            chip_rgb = (chips[query_idx].transpose(1, 2, 0) * 255).astype(np.uint8)
-            st.image(chip_rgb, caption=f"Query — chip #{query_idx}", width=180)
-
-        with st.expander("🖼️ Browse chips (sample)"):
-            sample_n   = min(24, n_chips)
-            step_size  = max(1, n_chips // sample_n)
-            sample_ids = list(range(0, n_chips, step_size))[:sample_n]
-            gcols      = st.columns(8)
-            for j, sid in enumerate(sample_ids):
-                rgb = (chips[sid].transpose(1, 2, 0) * 255).astype(np.uint8)
-                gcols[j % 8].image(rgb, use_container_width=True)
-                gcols[j % 8].markdown(f'<p class="chip-caption">#{sid}</p>', unsafe_allow_html=True)
-
-        find_btn = st.button(f"🔎 Find top-{top_k} similar chips", type="primary", key="sim_find")
-
-        if find_btn:
-            result_indices, result_scores = query_index(faiss_idx, embs, query_idx, top_k)
-            st.session_state.sim_query_idx = query_idx
-            st.session_state.sim_results   = (result_indices, result_scores)
-
-            if show_umap and st.session_state.sim_umap_proj is None:
-                with st.spinner("📐 Computing UMAP projection… (~30 s one-time)"):
-                    try:
-                        st.session_state.sim_umap_proj = umap_project(embs)
-                    except ImportError:
-                        st.warning("Install `umap-learn` for UMAP visualization.")
-                    except Exception as e:
-                        st.warning(f"UMAP failed: {e}")
-
-    # ── Step 4: Results ───────────────────────────────────────────────────────
-    if st.session_state.sim_results is not None:
-        result_indices, result_scores = st.session_state.sim_results
-        query_idx = st.session_state.sim_query_idx
-        chip_gdf  = st.session_state.sim_chip_gdf
-        chips     = st.session_state.sim_chips
-        bbox_used = st.session_state.sim_bbox
-
-        st.markdown("---")
-        st.markdown(f'<p class="section-header">03 · Top-{len(result_indices)} Similar Chips</p>',
-                    unsafe_allow_html=True)
-
-        n_cols   = min(len(result_indices), 8)
-        res_cols = st.columns(n_cols)
-        for col, (idx, score) in zip(res_cols, zip(result_indices, result_scores)):
-            rgb = (chips[idx].transpose(1, 2, 0) * 255).astype(np.uint8)
-            col.image(rgb, use_container_width=True)
-            col.markdown(f'<p class="chip-caption">#{idx}<br>{score:.4f}</p>', unsafe_allow_html=True)
-
-        tab_map, tab_umap, tab_table, tab_export = st.tabs(
-            ["🗺️ Map", "📐 Embedding Space", "📊 Table", "💾 Export"]
-        )
-
-        with tab_map:
-            center = (
-                ((bbox_used[1] + bbox_used[3]) / 2, (bbox_used[0] + bbox_used[2]) / 2)
-                if bbox_used
-                else (chip_gdf.dissolve().centroid.iloc[0].y,
-                      chip_gdf.dissolve().centroid.iloc[0].x)
-            )
-            fmap = build_result_map(query_idx, result_indices, result_scores, chip_gdf, center)
-            st_folium(fmap, width="100%", height=520, returned_objects=[], key="sim_result_map")
-
-        with tab_umap:
-            if st.session_state.sim_umap_proj is not None:
-                fig = build_umap_scatter(
-                    st.session_state.sim_umap_proj,
-                    query_idx, result_indices, result_scores, len(chips),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            elif show_umap:
-                st.info("UMAP not yet computed. Click **Find similar chips** to trigger it.")
+        with st.chat_message("assistant"):
+            if intent == "SEARCH":
+                item = st.session_state.naip_scene
+                if item is None:
+                    response = "No scene loaded. Fetch a NAIP tile first."
+                    st.markdown(response)
+                else:
+                    with st.spinner(f"🔍 Searching the scene for "{prompt}"…"):
+                        response = run_search(prompt, item)
+                    st.markdown(response)
+                    st.markdown("_Matching locations are shown on the map →_")
             else:
-                st.info("Enable **Show UMAP** above, then run a search.")
+                response = run_chat(prompt)
 
-        with tab_table:
-            df = pd.DataFrame({
-                "Rank":       range(1, len(result_indices) + 1),
-                "Chip ID":    result_indices,
-                "Cosine Sim": [f"{s:.6f}" for s in result_scores],
-                "Pixel Row":  [chip_gdf.loc[chip_gdf["chip_id"] == i, "pixel_row"].iloc[0] for i in result_indices],
-                "Pixel Col":  [chip_gdf.loc[chip_gdf["chip_id"] == i, "pixel_col"].iloc[0] for i in result_indices],
-            })
-            st.dataframe(df.set_index("Rank"), use_container_width=True)
-
-        with tab_export:
-            st.markdown("#### Download results")
-            result_gdf = chip_gdf[chip_gdf["chip_id"].isin(result_indices)].copy()
-            score_map  = dict(zip(result_indices, result_scores))
-            result_gdf["cosine_sim"] = result_gdf["chip_id"].map(score_map)
-            result_gdf["query_chip"] = query_idx
-            result_gdf["scene_id"]   = st.session_state.sim_scene_id
-
-            st.download_button(
-                "⬇️ GeoJSON — similar chip polygons",
-                data=result_gdf.to_json().encode(),
-                file_name=f"naip_similar_{st.session_state.sim_scene_id}.geojson",
-                mime="application/geo+json",
-                use_container_width=True,
-            )
-            df_exp = pd.DataFrame({"Rank": range(1, len(result_indices)+1),
-                                   "Chip ID": result_indices,
-                                   "Cosine Sim": result_scores})
-            st.download_button(
-                "⬇️ CSV — similarity scores",
-                data=df_exp.to_csv(index=False).encode(),
-                file_name=f"naip_scores_{st.session_state.sim_scene_id}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            buf = io.BytesIO()
-            np.save(buf, st.session_state.sim_embeddings[[query_idx] + result_indices])
-            st.download_button(
-                "⬇️ NPY — embeddings (query + results)",
-                data=buf.getvalue(),
-                file_name=f"naip_embeddings_{st.session_state.sim_scene_id}.npy",
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
-            st.caption(
-                "GeoJSON loads directly into QGIS, ArcGIS Pro, or GeoPandas.  \n"
-                "NPY: L2-normalized float32, shape (K+1, 2048)."
-            )
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.rerun()
