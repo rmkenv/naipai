@@ -12,7 +12,12 @@ import sys
 _ROOT = str(Path(__file__).parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from config import ESRI_TILES, ESRI_ATTR
+import importlib.util as _ilu
+if 'naip_config' not in sys.modules:
+    _s = _ilu.spec_from_file_location('naip_config', str(Path(__file__).parent.parent / 'config.py'))
+    _m = _ilu.module_from_spec(_s); _s.loader.exec_module(_m)
+    sys.modules['naip_config'] = _m
+from naip_config import ESRI_TILES, ESRI_ATTR
 
 
 # ── Satellite tile layer (shared) ─────────────────────────────────────────────

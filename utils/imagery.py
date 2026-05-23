@@ -11,11 +11,16 @@ import planetary_computer
 import rioxarray
 from shapely.geometry import box
 
-import sys
+import sys, importlib.util as _ilu
 _ROOT = str(Path(__file__).parent.parent)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from config import (
+# Load config explicitly to avoid name conflicts in Python 3.14
+if 'naip_config' not in sys.modules:
+    _s = _ilu.spec_from_file_location('naip_config', str(Path(__file__).parent.parent / 'config.py'))
+    _m = _ilu.module_from_spec(_s); _s.loader.exec_module(_m)
+    sys.modules['naip_config'] = _m
+from naip_config import (
     PC_STAC_URL, NAIP_COLLECTION, MAX_SCENES,
     OVERVIEW_LEVELS, DEFAULT_CHIP_SIZE, MAX_CHIPS, CACHE_DIR,
 )

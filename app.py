@@ -11,13 +11,23 @@ One chat interface, three modes — routed automatically by intent:
 Data: USDA NAIP via Microsoft Planetary Computer
 """
 
-import io, sys, logging, base64
+import io, sys, logging, base64, importlib.util
 from pathlib import Path
+
+# Explicitly load config.py to avoid name collision in Python 3.14
+_cfg_path = Path(__file__).parent / "config.py"
+_cfg_spec = importlib.util.spec_from_file_location("naip_config", _cfg_path)
+_cfg_mod  = importlib.util.module_from_spec(_cfg_spec)
+_cfg_spec.loader.exec_module(_cfg_mod)
+sys.modules["naip_config"] = _cfg_mod
+import naip_config as config
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_folium import st_folium
 from openai import OpenAI
 import pystac_client
 import planetary_computer as pc
@@ -26,7 +36,6 @@ from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds
 from PIL import Image, ImageDraw
 
-import config
 from utils.imagery import (
     load_naip_scene, chip_scene, chip_scene_4band,
     build_chip_geodataframe, cache_path,
@@ -444,7 +453,6 @@ with left:
 
     # ── Tab 1: Draw AOI ───────────────────────────────────────────────────────
     with map_tab:
-        from utils.viz import build_draw_map
         st.caption("Draw a rectangle to define your area of interest, then click **Load**.")
 
         draw_map = build_draw_map(
