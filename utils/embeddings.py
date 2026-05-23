@@ -15,7 +15,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 from config import (
     EMBED_DIM, BATCH_SIZE, IMAGENET_MEAN, IMAGENET_STD,
-    FAISS_INDEX_SUFFIX, EMBED_NPY_SUFFIX, CACHE_DIR,
 )
 
 
