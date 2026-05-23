@@ -289,7 +289,14 @@ def ensure_indexes(item):
 # ── Shared result store ───────────────────────────────────────────────────────
 def _store_results(idxs, scores, chip_gdf, chips, spec_reports=None):
     st.session_state.result_indices=idxs; st.session_state.result_scores=scores
-    st.session_state.result_chips=[chips[i] for i in idxs]
+    # Store chips as PNG bytes so they survive st.rerun() serialization cleanly
+    chip_pngs = []
+    for i in idxs:
+        rgb = (chips[i].transpose(1,2,0) * 255).clip(0,255).astype(np.uint8)
+        bio = io.BytesIO()
+        Image.fromarray(rgb).save(bio, format="PNG")
+        chip_pngs.append(bio.getvalue())
+    st.session_state.result_chips=chip_pngs
     st.session_state.result_spectral_reports=spec_reports
     # Centroid for map center — reproject to avoid geographic CRS warning
     center = (config.DEFAULT_LAT, config.DEFAULT_LON)
@@ -540,8 +547,7 @@ with left:
                 st.markdown("**Top matches:**")
                 rcols=st.columns(n_show)
                 for k in range(n_show):
-                    rgb=(rc[k].transpose(1,2,0)*255).astype(np.uint8)
-                    rcols[k].image(rgb, use_container_width=True)
+                    rcols[k].image(rc[k], use_container_width=True)
                     rcols[k].markdown(
                         f'<p class="result-chip">{rs[k]:.3f}</p>',
                         unsafe_allow_html=True)
