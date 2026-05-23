@@ -1,28 +1,18 @@
 """
 NAIP Intelligence Platform
 ===========================
-One chat interface, three modes — routed automatically by intent:
+One chat interface, three modes routed automatically by intent:
 
   CHAT      Ask anything about the imagery (VLM analysis)
-  SEARCH    Find features visually (ResNet-50 + FAISS cosine)
-  SPECTRAL  Query by spectral index / land cover signature
-            (NDVI, NDWI, EVI, SAVI, NDBI, brightness -- 4-band NAIP)
+  SEARCH    Find features visually  (ResNet-50 + FAISS cosine)
+  SPECTRAL  Query by spectral signature (NDVI/NDWI/EVI/SAVI/NDBI/Brightness)
 
+AOI selection: draw a rectangle on the interactive map OR enter lat/lon.
 Data: USDA NAIP via Microsoft Planetary Computer
 """
 
-import io, sys, logging, base64, importlib.util
+import io, logging, base64
 from pathlib import Path
-
-# Explicitly load config.py to avoid name collision in Python 3.14
-_cfg_path = Path(__file__).parent / "config.py"
-_cfg_spec = importlib.util.spec_from_file_location("naip_config", _cfg_path)
-_cfg_mod  = importlib.util.module_from_spec(_cfg_spec)
-_cfg_spec.loader.exec_module(_cfg_mod)
-sys.modules["naip_config"] = _cfg_mod
-import naip_config as config
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import streamlit as st
@@ -36,6 +26,7 @@ from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds
 from PIL import Image, ImageDraw
 
+import naip_config as config
 from utils.imagery import (
     load_naip_scene, chip_scene, chip_scene_4band,
     build_chip_geodataframe, cache_path,
@@ -52,13 +43,13 @@ from utils.spectral import (
     save_spectral_index, load_spectral_index,
     save_spectral_embeddings, load_spectral_embeddings,
 )
-from utils.viz import build_result_map
+from utils.viz import build_draw_map, build_result_map
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("naip_platform")
 
-# -- Page ---------------------------------------------------------------------
+# ── Page ──────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=config.APP_TITLE, page_icon=config.APP_ICON,
     layout="wide", initial_sidebar_state="expanded",
@@ -107,7 +98,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# -- Session state ------------------------------------------------------------
+# ── Session state ─────────────────────────────────────────────────────────────
 for k, v in {
     "naip_img": None, "naip_b64": None, "naip_scene": None,
     "messages": [],
@@ -117,16 +108,14 @@ for k, v in {
     "result_map_html": None, "result_chips": None,
     "result_scores": None, "result_indices": None,
     "result_spectral_reports": None,
-    # AOI selection
-    "aoi_bbox": None,      # [west, south, east, north] from drawn rectangle
-    "aoi_source": None,    # "map" | "latlon"
+    "aoi_bbox": None,
     "map_center": [config.DEFAULT_LAT, config.DEFAULT_LON],
     "map_zoom": config.DEFAULT_ZOOM,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# -- Sidebar ------------------------------------------------------------------
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### Configuration")
     def _s(k, d=""):
@@ -143,14 +132,15 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**How to use**")
     st.markdown("""<div class="hint-box">
+<b>Draw:</b> Use the map tab to draw a rectangle over your AOI.<br>
+<b>Point:</b> Enter lat/lon in the Lat/Lon tab.<br><br>
 <b>Chat:</b> "What land cover is present?"<br>
-<b>Visual search:</b> "Find all parking lots" · "Locate rooftops"<br>
-<b>Spectral search:</b> "Where is NDVI highest?" · "Find stressed vegetation" ·
-"Show impervious surfaces" · "Areas with high NDWI"
+<b>Visual:</b> "Find all parking lots"<br>
+<b>Spectral:</b> "Where is NDVI highest?" · "Find stressed vegetation"
 </div>""", unsafe_allow_html=True)
-    st.caption("Data: USDA NAIP via Planetary Computer")
+    st.caption("USDA NAIP via Planetary Computer")
 
-# -- Helpers ------------------------------------------------------------------
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def get_client():
     if not ollama_host or not ollama_key: return None
     return OpenAI(base_url=f"{ollama_host.rstrip('/')}/v1", api_key=ollama_key)
@@ -180,8 +170,21 @@ def spectral_bar(name, value):
             f'<div class="idx-bar-wrap"><div class="idx-bar" '
             f'style="width:{pct}%;background:{color};"></div></div>')
 
-# -- NAIP fetch ---------------------------------------------------------------
-def fetch_naip_point(lat, lon, buf=0.003):
+def _reset_results():
+    st.session_state.result_map_html        = None
+    st.session_state.result_chips           = None
+    st.session_state.result_scores          = None
+    st.session_state.result_spectral_reports = None
+
+# ── NAIP fetch ────────────────────────────────────────────────────────────────
+def _do_fetch(img, b64, item):
+    st.session_state.naip_img   = img
+    st.session_state.naip_b64   = b64
+    st.session_state.naip_scene = item
+    st.session_state.messages   = []
+    _reset_results()
+
+def fetch_naip_point(lat, lon, buf):
     catalog = pystac_client.Client.open(config.PC_STAC_URL, modifier=pc.sign_inplace)
     bbox = [lon-buf, lat-buf, lon+buf, lat+buf]
     items = list(catalog.search(
@@ -192,31 +195,27 @@ def fetch_naip_point(lat, lon, buf=0.003):
     with rasterio.open(item.assets["image"].href) as src:
         bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
         data   = src.read([1,2,3], window=from_bounds(*bounds, transform=src.transform))
-    data = np.clip(np.moveaxis(data,0,-1), 0, 255).astype(np.uint8)
+    data = np.clip(np.moveaxis(data,0,-1),0,255).astype(np.uint8)
     img  = Image.fromarray(data)
-    bio  = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+    bio  = io.BytesIO(); img.save(bio,format="PNG"); bio.seek(0)
     return img, base64.b64encode(bio.read()).decode(), item
 
-
 def fetch_naip_bbox(bbox):
-    """Fetch NAIP using a drawn [west, south, east, north] bounding box."""
-    west, south, east, north = bbox
     catalog = pystac_client.Client.open(config.PC_STAC_URL, modifier=pc.sign_inplace)
     items = list(catalog.search(
         collections=[config.NAIP_COLLECTION], bbox=bbox,
         limit=1, sortby="-properties.datetime").items())
-    if not items:
-        raise ValueError("No NAIP scenes found in this area.")
+    if not items: raise ValueError("No NAIP scenes found in this area.")
     item = items[0]
     with rasterio.open(item.assets["image"].href) as src:
         bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
-        data   = src.read([1, 2, 3], window=from_bounds(*bounds, transform=src.transform))
-    data = np.clip(np.moveaxis(data, 0, -1), 0, 255).astype(np.uint8)
+        data   = src.read([1,2,3], window=from_bounds(*bounds, transform=src.transform))
+    data = np.clip(np.moveaxis(data,0,-1),0,255).astype(np.uint8)
     img  = Image.fromarray(data)
-    bio  = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+    bio  = io.BytesIO(); img.save(bio,format="PNG"); bio.seek(0)
     return img, base64.b64encode(bio.read()).decode(), item
 
-# -- Index builder (visual + spectral) ----------------------------------------
+# ── Index builder ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _load_resnet(): return load_model()
 
@@ -241,14 +240,14 @@ def ensure_indexes(item):
 
     if vc and sc:
         st.info("Loading indexes from cache...")
-        chips = load_chips(cp); embs = load_embeddings(ep)
-        fidx  = load_index(ip); meta = load_meta(mp)
-        chips4= load_chips(cp4); sembs= load_spectral_embeddings(sep)
-        sidx  = load_spectral_index(sip)
+        chips=load_chips(cp); embs=load_embeddings(ep)
+        fidx=load_index(ip);  meta=load_meta(mp)
+        chips4=load_chips(cp4); sembs=load_spectral_embeddings(sep)
+        sidx=load_spectral_index(sip)
     else:
         with st.spinner("Loading NAIP scene..."):
             ds, ov = load_naip_scene(item)
-        st.success(f"Scene loaded - {ds.shape[1]}x{ds.shape[2]} px (overview {ov})")
+        st.success(f"Scene loaded — {ds.shape[1]}x{ds.shape[2]} px (overview {ov})")
 
         if not vc:
             with st.spinner("Chipping scene (RGB)..."):
@@ -260,11 +259,10 @@ def ensure_indexes(item):
             embs = embed_chips(chips, model, device, progress_callback=vcb)
             prog.empty()
             fidx = build_index(embs)
-            np.save(str(cp), chips); save_embeddings(embs, ep)
+            save_chips(chips, cp); save_embeddings(embs, ep)
             save_index(fidx, ip); save_meta({"positions":positions,"chip_gdf":chip_gdf}, mp)
         else:
-            chips=load_chips(cp); embs=load_embeddings(ep)
-            fidx=load_index(ip)
+            chips=load_chips(cp); embs=load_embeddings(ep); fidx=load_index(ip)
 
         meta = load_meta(mp)
 
@@ -276,7 +274,7 @@ def ensure_indexes(item):
             sembs = compute_spectral_embeddings(chips4, progress_callback=scb)
             prog2.empty()
             sidx  = build_spectral_index(sembs)
-            np.save(str(cp4), chips4)
+            save_chips(chips4, cp4)
             save_spectral_embeddings(sembs, sep); save_spectral_index(sidx, sip)
         else:
             chips4=load_chips(cp4); sembs=load_spectral_embeddings(sep)
@@ -286,35 +284,40 @@ def ensure_indexes(item):
     st.session_state.faiss_idx=fidx; st.session_state.chip_gdf=meta["chip_gdf"]
     st.session_state.chips4=chips4; st.session_state.spectral_embs=sembs
     st.session_state.spectral_idx=sidx; st.session_state.scene_id=scene_id
-    st.success(f"Indexes ready - {len(chips)} chips · visual 2048-d · spectral {sembs.shape[1]}-d")
+    st.success(f"Indexes ready — {len(chips)} chips · visual 2048-d · spectral {sembs.shape[1]}-d")
 
-# -- Shared result store -------------------------------------------------------
+# ── Shared result store ───────────────────────────────────────────────────────
 def _store_results(idxs, scores, chip_gdf, chips, spec_reports=None):
     st.session_state.result_indices=idxs; st.session_state.result_scores=scores
     st.session_state.result_chips=[chips[i] for i in idxs]
     st.session_state.result_spectral_reports=spec_reports
-    center=(config.DEFAULT_LAT, config.DEFAULT_LON)
+    # Centroid for map center — reproject to avoid geographic CRS warning
+    center = (config.DEFAULT_LAT, config.DEFAULT_LON)
     if chip_gdf is not None and len(chip_gdf):
-        c=chip_gdf.dissolve().centroid.iloc[0]; center=(c.y, c.x)
-    fmap=build_result_map(idxs[0] if idxs else 0, idxs, scores, chip_gdf, center)
-    st.session_state.result_map_html=fmap._repr_html_()
+        gdf_proj = chip_gdf.to_crs("EPSG:3857")
+        c = gdf_proj.dissolve().centroid.iloc[0]
+        c_wgs = gdf_proj.dissolve().to_crs("EPSG:4326").centroid.iloc[0]
+        center = (c_wgs.y, c_wgs.x)
+    fmap = build_result_map(idxs[0] if idxs else 0, idxs, scores, chip_gdf, center)
+    st.session_state.result_map_html = fmap._repr_html_()
 
-# -- Visual search ------------------------------------------------------------
+# ── Visual search ─────────────────────────────────────────────────────────────
 def run_visual_search(query, item):
     ensure_indexes(item)
     chips=st.session_state.chips; embs=st.session_state.embeddings
     fidx=st.session_state.faiss_idx; chip_gdf=st.session_state.chip_gdf
     n=len(chips)
 
+    # Build labelled mosaic for VLM chip selection
     sample_ids=list(range(0, n, max(1, n//16)))[:16]
     cols_n=4; rows_n=(len(sample_ids)+cols_n-1)//cols_n
     mosaic=Image.new("RGB",(chip_size*cols_n,(chip_size+24)*rows_n),(20,20,30))
     draw=ImageDraw.Draw(mosaic)
     for j,sid in enumerate(sample_ids):
         rgb=(chips[sid].transpose(1,2,0)*255).astype(np.uint8)
-        r,c=j//cols_n, j%cols_n
-        mosaic.paste(Image.fromarray(rgb),(c*chip_size, r*(chip_size+24)))
-        draw.text((c*chip_size+4, r*(chip_size+24)+chip_size+4),f"#{sid}",fill=(150,200,255))
+        r,c=j//cols_n,j%cols_n
+        mosaic.paste(Image.fromarray(rgb),(c*chip_size,r*(chip_size+24)))
+        draw.text((c*chip_size+4,r*(chip_size+24)+chip_size+4),f"#{sid}",fill=(150,200,255))
     bio=io.BytesIO(); mosaic.save(bio,format="PNG"); bio.seek(0)
     mb64=base64.b64encode(bio.read()).decode()
 
@@ -325,7 +328,10 @@ def run_visual_search(query, item):
             r=client.chat.completions.create(
                 model=ollama_model, max_tokens=10, temperature=0,
                 messages=[{"role":"user","content":[
-                    {"type":"text","text":f'User wants to find: "{query}". Each tile labelled with chip index. Which single index best matches? Reply with ONLY the number.'},
+                    {"type":"text","text":(
+                        f'User wants to find: "{query}". '
+                        f'Each tile is labelled with its chip index (e.g. #42). '
+                        f'Which single chip index best matches? Reply with ONLY the number.')},
                     {"type":"image_url","image_url":{"url":f"data:image/png;base64,{mb64}"}},
                 ]}])
             raw=r.choices[0].message.content.strip().replace("#","")
@@ -358,7 +364,7 @@ def run_visual_search(query, item):
         except Exception as e: log.warning(f"Narration: {e}")
     return narration
 
-# -- Spectral search ----------------------------------------------------------
+# ── Spectral search ───────────────────────────────────────────────────────────
 def run_spectral_search(query, item):
     ensure_indexes(item)
     chips4=st.session_state.chips4; sembs=st.session_state.spectral_embs
@@ -369,9 +375,7 @@ def run_spectral_search(query, item):
     if qvec is not None:
         idxs, scores = query_spectral_index(sidx, sembs, qvec, top_k)
     else:
-        # Ask VLM to map query to a land cover concept
-        client=get_client()
-        qvec=None
+        client=get_client(); qvec=None
         if client and st.session_state.naip_b64:
             try:
                 r=client.chat.completions.create(
@@ -416,7 +420,7 @@ def run_spectral_search(query, item):
         except Exception as e: log.warning(f"Spectral narration: {e}")
     return narration
 
-# -- Chat ---------------------------------------------------------------------
+# ── Chat ──────────────────────────────────────────────────────────────────────
 def run_chat(text):
     client=get_client()
     if not client: return "Add Ollama credentials in the sidebar."
@@ -442,33 +446,29 @@ def run_chat(text):
     except Exception as e: full=f"Model error: {e}"; box.markdown(full)
     return full
 
-# -- Layout -------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYOUT
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 left, right = st.columns([1, 1], gap="large")
 
 with left:
-
     # ── AOI selection tabs ────────────────────────────────────────────────────
     map_tab, latlon_tab = st.tabs(["🗺️ Draw on Map", "📍 Lat / Lon"])
 
-    # ── Tab 1: Draw AOI ───────────────────────────────────────────────────────
     with map_tab:
-        st.caption("Draw a rectangle to define your area of interest, then click **Load**.")
-
+        st.caption("Draw a rectangle to define your AOI, then click Load.")
         draw_map = build_draw_map(
             center=tuple(st.session_state.map_center),
             zoom=st.session_state.map_zoom,
             existing_bbox=st.session_state.aoi_bbox,
         )
         map_data = st_folium(
-            draw_map,
-            width="100%",
-            height=340,
-            returned_objects=["all_drawings", "last_object_clicked"],
+            draw_map, width="100%", height=340,
+            returned_objects=["all_drawings"],
             key="aoi_draw_map",
         )
 
-        # Parse drawn rectangle
         def _parse_bbox(md):
             try:
                 drawings = md.get("all_drawings") or []
@@ -476,87 +476,61 @@ with left:
                 geom = drawings[-1]["geometry"]
                 if geom["type"] != "Polygon": return None
                 coords = geom["coordinates"][0]
-                lngs = [c[0] for c in coords]
-                lats = [c[1] for c in coords]
+                lngs=[c[0] for c in coords]; lats=[c[1] for c in coords]
                 return [min(lngs), min(lats), max(lngs), max(lats)]
-            except Exception:
-                return None
+            except Exception: return None
 
         drawn = _parse_bbox(map_data)
         if drawn and drawn != st.session_state.aoi_bbox:
-            w, s, e, n = drawn
-            if (e - w) > 0 and (n - s) > 0:
-                st.session_state.aoi_bbox   = drawn
-                st.session_state.aoi_source = "map"
+            w,s,e,n = drawn
+            if (e-w) > 0 and (n-s) > 0:
+                st.session_state.aoi_bbox = drawn
 
         if st.session_state.aoi_bbox:
-            w, s, e, n = st.session_state.aoi_bbox
+            w,s,e,n = st.session_state.aoi_bbox
             st.caption(f"AOI: W {w:.4f}  S {s:.4f}  E {e:.4f}  N {n:.4f}")
-            if (e - w) * (n - s) > 0.25:
-                st.warning("Large AOI — consider drawing a smaller box for faster loading.")
+            if (e-w)*(n-s) > 0.25:
+                st.warning("Large AOI — draw a smaller box for faster loading.")
 
-        map_load = st.button("🛰️ Load NAIP from AOI",
-                             disabled=(st.session_state.aoi_bbox is None),
-                             use_container_width=True,
-                             key="map_load_btn")
-        if map_load:
+        if st.button("🛰️ Load NAIP from AOI",
+                     disabled=(st.session_state.aoi_bbox is None),
+                     use_container_width=True, key="map_load_btn"):
             with st.spinner("Fetching NAIP..."):
                 try:
-                    img, b64, item = fetch_naip_bbox(st.session_state.aoi_bbox)
-                    st.session_state.naip_img   = img
-                    st.session_state.naip_b64   = b64
-                    st.session_state.naip_scene = item
-                    st.session_state.messages   = []
-                    st.session_state.result_map_html = None
-                    st.session_state.result_chips    = None
-                    st.session_state.result_scores   = None
-                    st.session_state.result_spectral_reports = None
-                    # Recenter map on the loaded area
-                    w, s, e, n = st.session_state.aoi_bbox
+                    img,b64,item = fetch_naip_bbox(st.session_state.aoi_bbox)
+                    _do_fetch(img, b64, item)
+                    w,s,e,n = st.session_state.aoi_bbox
                     st.session_state.map_center = [(s+n)/2, (w+e)/2]
                     st.success(f"Loaded — {img.width}x{img.height} px · {item.datetime.date()}")
-                except Exception as e:
-                    st.error(str(e))
+                except Exception as e: st.error(str(e))
 
-    # ── Tab 2: Lat / Lon ──────────────────────────────────────────────────────
     with latlon_tab:
         st.caption("Enter a point coordinate and buffer to define the area.")
-        c1, c2, c3 = st.columns([2, 2, 1])
+        c1,c2,c3 = st.columns([2,2,1])
         with c1: lat = st.number_input("Lat", value=config.DEFAULT_LAT, format="%.4f")
         with c2: lon = st.number_input("Lon", value=config.DEFAULT_LON, format="%.4f")
-        with c3: buf = st.slider("Buffer °", 0.001, 0.01, 0.003, step=0.001)
+        with c3: buf = st.slider("Buffer", 0.001, 0.01, 0.003, step=0.001)
 
-        ll_load = st.button("🛰️ Load NAIP from Point",
-                            use_container_width=True,
-                            key="ll_load_btn")
-        if ll_load:
+        if st.button("🛰️ Load NAIP from Point",
+                     use_container_width=True, key="ll_load_btn"):
             with st.spinner("Fetching..."):
                 try:
-                    img, b64, item = fetch_naip_point(lat, lon, buf)
-                    st.session_state.naip_img   = img
-                    st.session_state.naip_b64   = b64
-                    st.session_state.naip_scene = item
-                    st.session_state.messages   = []
-                    st.session_state.result_map_html = None
-                    st.session_state.result_chips    = None
-                    st.session_state.result_scores   = None
-                    st.session_state.result_spectral_reports = None
-                    # Sync AOI bbox and map center from the point + buffer
+                    img,b64,item = fetch_naip_point(lat, lon, buf)
+                    _do_fetch(img, b64, item)
                     st.session_state.aoi_bbox   = [lon-buf, lat-buf, lon+buf, lat+buf]
-                    st.session_state.aoi_source = "latlon"
                     st.session_state.map_center = [lat, lon]
                     st.session_state.map_zoom   = 13
                     st.success(f"Loaded — {img.width}x{img.height} px · {item.datetime.date()}")
-                except Exception as e:
-                    st.error(str(e))
+                except Exception as e: st.error(str(e))
 
+    # ── Imagery display ───────────────────────────────────────────────────────
     st.markdown("#### NAIP Imagery")
     if st.session_state.naip_img:
         st.image(st.session_state.naip_img, use_container_width=True)
 
         if st.session_state.result_map_html:
             st.markdown("#### Matching Locations")
-            components.html(st.session_state.result_map_html, height=300)
+            st.iframe(st.session_state.result_map_html, height=300)
 
             rc=st.session_state.result_chips or []
             rs=st.session_state.result_scores or []
@@ -567,8 +541,10 @@ with left:
                 rcols=st.columns(n_show)
                 for k in range(n_show):
                     rgb=(rc[k].transpose(1,2,0)*255).astype(np.uint8)
-                    rcols[k].image(rgb,use_container_width=True)
-                    rcols[k].markdown(f'<p class="result-chip">{rs[k]:.3f}</p>',unsafe_allow_html=True)
+                    rcols[k].image(rgb, use_container_width=True)
+                    rcols[k].markdown(
+                        f'<p class="result-chip">{rs[k]:.3f}</p>',
+                        unsafe_allow_html=True)
 
             if sr:
                 st.markdown("#### Spectral Index Summary")
@@ -579,10 +555,11 @@ with left:
                         f'<div class="spectral-card">'
                         f'<div style="font-size:0.72rem;color:#8b949e;font-family:Space Mono,monospace;margin-bottom:6px;">'
                         f'Match #{k+1} · {r["ndvi_class"]} · {r["ndwi_class"]}</div>'
-                        f'{bars}</div>',unsafe_allow_html=True)
+                        f'{bars}</div>', unsafe_allow_html=True)
     else:
-        st.info("Enter coordinates and click Load NAIP Tile to begin.")
+        st.info("Draw an AOI on the map or enter coordinates, then click Load.")
 
+# ── Right: chat ───────────────────────────────────────────────────────────────
 with right:
     st.markdown("#### Ask anything about this image")
     for msg in st.session_state.messages:
@@ -591,7 +568,8 @@ with right:
                 i=msg["intent"]
                 cls,label=(("pill-spectral","SPECTRAL") if i=="SPECTRAL" else
                             ("pill-search","SEARCH") if i=="SEARCH" else ("pill-chat","CHAT"))
-                st.markdown(f'<span class="intent-pill {cls}">{label}</span>',unsafe_allow_html=True)
+                st.markdown(f'<span class="intent-pill {cls}">{label}</span>',
+                            unsafe_allow_html=True)
             st.markdown(msg["content"])
 
     prompt=st.chat_input(
@@ -614,14 +592,14 @@ with right:
             if intent=="SPECTRAL":
                 if not item: response="Load a NAIP tile first."; st.markdown(response)
                 else:
-                    with st.spinner(f"Running spectral search..."):
+                    with st.spinner("Running spectral search..."):
                         response=run_spectral_search(prompt,item)
                     st.markdown(response)
                     st.markdown("_Spectral matches and index cards shown on the left_")
             elif intent=="SEARCH":
                 if not item: response="Load a NAIP tile first."; st.markdown(response)
                 else:
-                    with st.spinner(f"Searching visually..."):
+                    with st.spinner("Searching visually..."):
                         response=run_visual_search(prompt,item)
                     st.markdown(response)
                     st.markdown("_Matching locations shown on the map_")
