@@ -28,7 +28,7 @@ OVERVIEW_LEVELS = [2, 1, 0]
 # ── Ollama Cloud ──────────────────────────────────────────────────────────────
 OLLAMA_HOST_DEFAULT  = os.getenv("OLLAMA_HOST", "")
 OLLAMA_KEY_DEFAULT   = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_MODEL_DEFAULT = os.getenv("OLLAMA_MODEL", "qwen3-vl:7b")
+OLLAMA_MODEL_DEFAULT = os.getenv("OLLAMA_MODEL", "qwen3-vl:235b-cloud")
 
 # ── Intent routing ────────────────────────────────────────────────────────────
 INTENT_SYSTEM_PROMPT = """\

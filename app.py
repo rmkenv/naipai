@@ -108,6 +108,11 @@ for k, v in {
     "result_map_html": None, "result_chips": None,
     "result_scores": None, "result_indices": None,
     "result_spectral_reports": None,
+    # AOI selection
+    "aoi_bbox": None,      # [west, south, east, north] from drawn rectangle
+    "aoi_source": None,    # "map" | "latlon"
+    "map_center": [config.DEFAULT_LAT, config.DEFAULT_LON],
+    "map_zoom": config.DEFAULT_ZOOM,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -179,6 +184,25 @@ def fetch_naip_point(lat, lon, buf=0.003):
         bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
         data   = src.read([1,2,3], window=from_bounds(*bounds, transform=src.transform))
     data = np.clip(np.moveaxis(data,0,-1), 0, 255).astype(np.uint8)
+    img  = Image.fromarray(data)
+    bio  = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+    return img, base64.b64encode(bio.read()).decode(), item
+
+
+def fetch_naip_bbox(bbox):
+    """Fetch NAIP using a drawn [west, south, east, north] bounding box."""
+    west, south, east, north = bbox
+    catalog = pystac_client.Client.open(config.PC_STAC_URL, modifier=pc.sign_inplace)
+    items = list(catalog.search(
+        collections=[config.NAIP_COLLECTION], bbox=bbox,
+        limit=1, sortby="-properties.datetime").items())
+    if not items:
+        raise ValueError("No NAIP scenes found in this area.")
+    item = items[0]
+    with rasterio.open(item.assets["image"].href) as src:
+        bounds = transform_bounds("EPSG:4326", src.crs, *bbox)
+        data   = src.read([1, 2, 3], window=from_bounds(*bounds, transform=src.transform))
+    data = np.clip(np.moveaxis(data, 0, -1), 0, 255).astype(np.uint8)
     img  = Image.fromarray(data)
     bio  = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
     return img, base64.b64encode(bio.read()).decode(), item
@@ -414,22 +438,109 @@ st.markdown("---")
 left, right = st.columns([1, 1], gap="large")
 
 with left:
-    st.markdown("#### Location")
-    c1,c2,c3=st.columns([2,2,1])
-    with c1: lat=st.number_input("Lat", value=config.DEFAULT_LAT, format="%.4f")
-    with c2: lon=st.number_input("Lon", value=config.DEFAULT_LON, format="%.4f")
-    with c3: buf=st.slider("Buffer",0.001,0.01,0.003,step=0.001)
 
-    if st.button("Load NAIP Tile", use_container_width=True):
-        with st.spinner("Fetching..."):
+    # ── AOI selection tabs ────────────────────────────────────────────────────
+    map_tab, latlon_tab = st.tabs(["🗺️ Draw on Map", "📍 Lat / Lon"])
+
+    # ── Tab 1: Draw AOI ───────────────────────────────────────────────────────
+    with map_tab:
+        from utils.viz import build_draw_map
+        st.caption("Draw a rectangle to define your area of interest, then click **Load**.")
+
+        draw_map = build_draw_map(
+            center=tuple(st.session_state.map_center),
+            zoom=st.session_state.map_zoom,
+            existing_bbox=st.session_state.aoi_bbox,
+        )
+        map_data = st_folium(
+            draw_map,
+            width="100%",
+            height=340,
+            returned_objects=["all_drawings", "last_object_clicked"],
+            key="aoi_draw_map",
+        )
+
+        # Parse drawn rectangle
+        def _parse_bbox(md):
             try:
-                img,b64,item=fetch_naip_point(lat,lon,buf)
-                st.session_state.naip_img=img; st.session_state.naip_b64=b64
-                st.session_state.naip_scene=item; st.session_state.messages=[]
-                st.session_state.result_map_html=None; st.session_state.result_chips=None
-                st.session_state.result_scores=None; st.session_state.result_spectral_reports=None
-                st.success(f"Loaded - {img.width}x{img.height} px - {item.datetime.date()}")
-            except Exception as e: st.error(str(e))
+                drawings = md.get("all_drawings") or []
+                if not drawings: return None
+                geom = drawings[-1]["geometry"]
+                if geom["type"] != "Polygon": return None
+                coords = geom["coordinates"][0]
+                lngs = [c[0] for c in coords]
+                lats = [c[1] for c in coords]
+                return [min(lngs), min(lats), max(lngs), max(lats)]
+            except Exception:
+                return None
+
+        drawn = _parse_bbox(map_data)
+        if drawn and drawn != st.session_state.aoi_bbox:
+            w, s, e, n = drawn
+            if (e - w) > 0 and (n - s) > 0:
+                st.session_state.aoi_bbox   = drawn
+                st.session_state.aoi_source = "map"
+
+        if st.session_state.aoi_bbox:
+            w, s, e, n = st.session_state.aoi_bbox
+            st.caption(f"AOI: W {w:.4f}  S {s:.4f}  E {e:.4f}  N {n:.4f}")
+            if (e - w) * (n - s) > 0.25:
+                st.warning("Large AOI — consider drawing a smaller box for faster loading.")
+
+        map_load = st.button("🛰️ Load NAIP from AOI",
+                             disabled=(st.session_state.aoi_bbox is None),
+                             use_container_width=True,
+                             key="map_load_btn")
+        if map_load:
+            with st.spinner("Fetching NAIP..."):
+                try:
+                    img, b64, item = fetch_naip_bbox(st.session_state.aoi_bbox)
+                    st.session_state.naip_img   = img
+                    st.session_state.naip_b64   = b64
+                    st.session_state.naip_scene = item
+                    st.session_state.messages   = []
+                    st.session_state.result_map_html = None
+                    st.session_state.result_chips    = None
+                    st.session_state.result_scores   = None
+                    st.session_state.result_spectral_reports = None
+                    # Recenter map on the loaded area
+                    w, s, e, n = st.session_state.aoi_bbox
+                    st.session_state.map_center = [(s+n)/2, (w+e)/2]
+                    st.success(f"Loaded — {img.width}x{img.height} px · {item.datetime.date()}")
+                except Exception as e:
+                    st.error(str(e))
+
+    # ── Tab 2: Lat / Lon ──────────────────────────────────────────────────────
+    with latlon_tab:
+        st.caption("Enter a point coordinate and buffer to define the area.")
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1: lat = st.number_input("Lat", value=config.DEFAULT_LAT, format="%.4f")
+        with c2: lon = st.number_input("Lon", value=config.DEFAULT_LON, format="%.4f")
+        with c3: buf = st.slider("Buffer °", 0.001, 0.01, 0.003, step=0.001)
+
+        ll_load = st.button("🛰️ Load NAIP from Point",
+                            use_container_width=True,
+                            key="ll_load_btn")
+        if ll_load:
+            with st.spinner("Fetching..."):
+                try:
+                    img, b64, item = fetch_naip_point(lat, lon, buf)
+                    st.session_state.naip_img   = img
+                    st.session_state.naip_b64   = b64
+                    st.session_state.naip_scene = item
+                    st.session_state.messages   = []
+                    st.session_state.result_map_html = None
+                    st.session_state.result_chips    = None
+                    st.session_state.result_scores   = None
+                    st.session_state.result_spectral_reports = None
+                    # Sync AOI bbox and map center from the point + buffer
+                    st.session_state.aoi_bbox   = [lon-buf, lat-buf, lon+buf, lat+buf]
+                    st.session_state.aoi_source = "latlon"
+                    st.session_state.map_center = [lat, lon]
+                    st.session_state.map_zoom   = 13
+                    st.success(f"Loaded — {img.width}x{img.height} px · {item.datetime.date()}")
+                except Exception as e:
+                    st.error(str(e))
 
     st.markdown("#### NAIP Imagery")
     if st.session_state.naip_img:
